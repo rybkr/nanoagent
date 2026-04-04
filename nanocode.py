@@ -3,9 +3,29 @@
 
 import glob as globlib, json, os, re, subprocess, urllib.request
 
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-API_URL = "https://openrouter.ai/api/v1/messages" if OPENROUTER_KEY else "https://api.anthropic.com/v1/messages"
-MODEL = os.environ.get("MODEL", "anthropic/claude-opus-4.5" if OPENROUTER_KEY else "claude-opus-4-5")
+
+def load_dotenv(path=".env"):
+    try:
+        with open(path) as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+
+
+load_dotenv()
+
+API_URL = os.environ.get(
+    "GENAI_STUDIO_API_URL", "https://genai.rcac.purdue.edu/api/chat/completions"
+)
+API_KEY = os.environ.get("GENAI_STUDIO_API_KEY", "")
+MODEL = os.environ.get("MODEL", os.environ.get("GENAI_STUDIO_MODEL", "llama3.1:latest"))
 
 # ANSI colors
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -167,26 +187,164 @@ def make_schema():
     return result
 
 
+def make_studio_tools():
+    result = []
+    for tool in make_schema():
+        result.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["input_schema"],
+                },
+            }
+        )
+    return result
+
+
+def convert_messages(system_prompt, messages):
+    result = [{"role": "system", "content": system_prompt}]
+    for message in messages:
+        role = message["role"]
+        content = message["content"]
+
+        if role == "user" and isinstance(content, str):
+            result.append({"role": "user", "content": content})
+            continue
+
+        if role == "assistant" and isinstance(content, list):
+            text_parts = []
+            tool_calls = []
+            for block in content:
+                if block["type"] == "text":
+                    text_parts.append(block["text"])
+                elif block["type"] == "tool_use":
+                    tool_calls.append(
+                        {
+                            "id": block["id"],
+                            "type": "function",
+                            "function": {
+                                "name": block["name"],
+                                "arguments": json.dumps(block["input"]),
+                            },
+                        }
+                    )
+
+            assistant_message = {
+                "role": "assistant",
+                "content": "\n".join(text_parts),
+            }
+            if tool_calls:
+                assistant_message["tool_calls"] = tool_calls
+            result.append(assistant_message)
+            continue
+
+        if role == "user" and isinstance(content, list):
+            for block in content:
+                if block["type"] == "tool_result":
+                    result.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": block["tool_use_id"],
+                            "content": block["content"],
+                        }
+                    )
+
+    return result
+
+
+def parse_tool_arguments(arguments):
+    if isinstance(arguments, dict):
+        return arguments
+    if not arguments:
+        return {}
+    return json.loads(arguments)
+
+
+def normalize_response(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    choices = payload.get("choices", [])
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
+    content = []
+
+    text = message.get("content")
+    if isinstance(text, str) and text:
+        content.append({"type": "text", "text": text})
+
+    for idx, tool_call in enumerate(message.get("tool_calls") or []):
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        if not function.get("name"):
+            continue
+        content.append(
+            {
+                "type": "tool_use",
+                "id": tool_call.get("id", f"call_{idx}"),
+                "name": function["name"],
+                "input": parse_tool_arguments(function.get("arguments")),
+            }
+        )
+
+    return {"content": content}
+
+
 def call_api(messages, system_prompt):
+    if not API_KEY:
+        raise RuntimeError("Missing GENAI_STUDIO_API_KEY")
+
+    fallback_prompt = (
+        "\n\nIf tool calling is unsupported and you need a tool, respond with JSON only: "
+        '{"tool_calls":[{"id":"call_1","name":"tool_name","arguments":{"arg":"value"}}]}.'
+    )
     request = urllib.request.Request(
         API_URL,
         data=json.dumps(
             {
                 "model": MODEL,
                 "max_tokens": 8192,
-                "system": system_prompt,
-                "messages": messages,
-                "tools": make_schema(),
+                "messages": convert_messages(system_prompt + fallback_prompt, messages),
+                "tools": make_studio_tools(),
             }
         ).encode(),
         headers={
             "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-            **({"Authorization": f"Bearer {OPENROUTER_KEY}"} if OPENROUTER_KEY else {"x-api-key": os.environ.get("ANTHROPIC_API_KEY", "")}),
+            "Authorization": f"Bearer {API_KEY}",
         },
     )
     response = urllib.request.urlopen(request)
-    return json.loads(response.read())
+    payload = json.loads(response.read())
+    normalized = normalize_response(payload)
+    if normalized["content"]:
+        return normalized
+
+    choices = payload.get("choices", []) if isinstance(payload, dict) else []
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
+    text = message.get("content", "")
+    try:
+        structured = json.loads(text) if isinstance(text, str) and text else {}
+    except json.JSONDecodeError:
+        structured = {}
+
+    tool_calls = structured.get("tool_calls", []) if isinstance(structured, dict) else []
+    if tool_calls:
+        return {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_call.get("id", f"call_{idx}"),
+                    "name": tool_call["name"],
+                    "input": tool_call.get("arguments", {}),
+                }
+                for idx, tool_call in enumerate(tool_calls)
+                if isinstance(tool_call, dict) and tool_call.get("name")
+            ]
+        }
+
+    return normalized
 
 
 def separator():
@@ -198,7 +356,7 @@ def render_markdown(text):
 
 
 def main():
-    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}\n")
+    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} (GenAI Studio) | {os.getcwd()}{RESET}\n")
     messages = []
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
 

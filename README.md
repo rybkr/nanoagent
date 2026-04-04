@@ -16,24 +16,15 @@ Built using Claude Code, then used to build itself.
 ## Usage
 
 ```bash
-export ANTHROPIC_API_KEY="your-key"
+export GENAI_STUDIO_API_KEY="your-key"
 python nanocode.py
 ```
 
-### OpenRouter
-
-Use [OpenRouter](https://openrouter.ai) to access any model:
+To use a different Studio model or endpoint:
 
 ```bash
-export OPENROUTER_API_KEY="your-key"
-python nanocode.py
-```
-
-To use a different model:
-
-```bash
-export OPENROUTER_API_KEY="your-key"
-export MODEL="openai/gpt-5.2"
+export MODEL="llama3.1:latest"
+export GENAI_STUDIO_API_URL="https://genai.rcac.purdue.edu/api/chat/completions"
 python nanocode.py
 ```
 
