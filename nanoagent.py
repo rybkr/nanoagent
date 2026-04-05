@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""nanocode - minimal claude code alternative"""
+"""nanoagent - minimal claude code alternative"""
 
 import glob as globlib, json, os, re, subprocess, urllib.request
 
@@ -453,7 +453,7 @@ def render_markdown(text):
 
 
 def main():
-    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} (GenAI Studio) | {os.getcwd()}{RESET}\n")
+    print(f"{BOLD}nanoagent{RESET} | {DIM}{MODEL} (GenAI Studio) | {os.getcwd()}{RESET}\n")
     messages = []
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
 
