@@ -26,6 +26,10 @@ API_URL = os.environ.get(
 )
 API_KEY = os.environ.get("GENAI_STUDIO_API_KEY", os.environ.get("GENAI_STUDIO_API_KEY"))
 MODEL = os.environ.get("MODEL", os.environ.get("GENAI_STUDIO_MODEL", "llama3.1:latest"))
+TRACE_PATH = os.environ.get("NANOCODE_TRACE_PATH", "results/traces.jsonl")
+DEFAULT_TASK_ID = os.environ.get("NANOCODE_TASK_ID", "interactive")
+DEFAULT_CONDITION = os.environ.get("NANOCODE_CONDITION", "single")
+TRACE_STATE = {"cumulative_total": 0}
 
 # ANSI colors
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -262,36 +266,155 @@ def parse_tool_arguments(arguments):
     return json.loads(arguments)
 
 
-def normalize_response(payload):
-    payload = payload if isinstance(payload, dict) else {}
-    choices = payload.get("choices", [])
-    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
-    message = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
+def normalize_usage(payload):
+    usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+    total_tokens = usage.get("total_tokens")
+    if total_tokens is None:
+        total_tokens = input_tokens + output_tokens
+
+    return {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "total_tokens": int(total_tokens),
+    }
+
+
+def make_content_blocks(assistant_text, tool_calls):
     content = []
-
-    text = message.get("content")
-    if isinstance(text, str) and text:
-        content.append({"type": "text", "text": text})
-
-    for idx, tool_call in enumerate(message.get("tool_calls") or []):
-        if not isinstance(tool_call, dict):
-            continue
-        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
-        if not function.get("name"):
-            continue
+    if assistant_text:
+        content.append({"type": "text", "text": assistant_text})
+    for idx, tool_call in enumerate(tool_calls):
         content.append(
             {
                 "type": "tool_use",
                 "id": tool_call.get("id", f"call_{idx}"),
+                "name": tool_call["name"],
+                "input": tool_call["arguments"],
+            }
+        )
+    return content
+
+
+def normalize_tool_calls(message):
+    result = []
+    for idx, tool_call in enumerate(message.get("tool_calls") or []):
+        if not isinstance(tool_call, dict):
+            continue
+        function = (
+            tool_call.get("function")
+            if isinstance(tool_call.get("function"), dict)
+            else {}
+        )
+        if not function.get("name"):
+            continue
+        result.append(
+            {
+                "id": tool_call.get("id", f"call_{idx}"),
                 "name": function["name"],
-                "input": parse_tool_arguments(function.get("arguments")),
+                "arguments": parse_tool_arguments(function.get("arguments")),
+            }
+        )
+    return result
+
+
+def extract_structured_response(text):
+    try:
+        structured = json.loads(text) if isinstance(text, str) and text else {}
+    except json.JSONDecodeError:
+        structured = {}
+
+    if not isinstance(structured, dict):
+        structured = {}
+
+    assistant_text = structured.get("assistant_text")
+    if not isinstance(assistant_text, str):
+        assistant_text = text if isinstance(text, str) else ""
+
+    tool_calls = []
+    for idx, tool_call in enumerate(structured.get("tool_calls", [])):
+        if not isinstance(tool_call, dict) or not tool_call.get("name"):
+            continue
+        arguments = tool_call.get("arguments", {})
+        if not isinstance(arguments, dict):
+            arguments = parse_tool_arguments(arguments)
+        tool_calls.append(
+            {
+                "id": tool_call.get("id", f"call_{idx}"),
+                "name": tool_call["name"],
+                "arguments": arguments,
             }
         )
 
-    return {"content": content}
+    return assistant_text, tool_calls
 
 
-def call_api(model, max_tokens, system, messages, tools):
+def append_trace_row(task_id, condition, role, usage, stop_reason):
+    trace_dir = os.path.dirname(TRACE_PATH)
+    if trace_dir:
+        os.makedirs(trace_dir, exist_ok=True)
+
+    TRACE_STATE["cumulative_total"] += usage["total_tokens"]
+    row = {
+        "task_id": task_id,
+        "condition": condition,
+        "role": role,
+        "input_tokens": usage["input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "total_tokens": usage["total_tokens"],
+        "cumulative_total": TRACE_STATE["cumulative_total"],
+        "stop_reason": stop_reason,
+    }
+    with open(TRACE_PATH, "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def normalize_response(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    choices = payload.get("choices", [])
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = (
+        first_choice.get("message")
+        if isinstance(first_choice.get("message"), dict)
+        else {}
+    )
+    text = message.get("content", "")
+    tool_calls = normalize_tool_calls(message)
+
+    if tool_calls:
+        assistant_text = text if isinstance(text, str) else ""
+    else:
+        assistant_text, tool_calls = extract_structured_response(text)
+
+    stop_reason = first_choice.get("finish_reason") or payload.get("stop_reason") or "stop"
+    if tool_calls and stop_reason == "stop":
+        stop_reason = "tool_calls"
+
+    usage = normalize_usage(payload)
+    content = make_content_blocks(assistant_text, tool_calls)
+    return {
+        "assistant_text": assistant_text,
+        "tool_calls": [{"name": call["name"], "arguments": call["arguments"]} for call in tool_calls],
+        "usage": usage,
+        "stop_reason": stop_reason,
+        "content": content,
+    }
+
+
+def call_api(
+    model,
+    max_tokens,
+    system,
+    messages,
+    tools,
+    task_id=DEFAULT_TASK_ID,
+    condition=DEFAULT_CONDITION,
+    role="single",
+):
     if not API_KEY:
         raise RuntimeError("Missing GENAI_STUDIO_API_KEY")
 
@@ -317,33 +440,7 @@ def call_api(model, max_tokens, system, messages, tools):
     response = urllib.request.urlopen(request)
     payload = json.loads(response.read())
     normalized = normalize_response(payload)
-    if normalized["content"]:
-        return normalized
-
-    choices = payload.get("choices", []) if isinstance(payload, dict) else []
-    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
-    message = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
-    text = message.get("content", "")
-    try:
-        structured = json.loads(text) if isinstance(text, str) and text else {}
-    except json.JSONDecodeError:
-        structured = {}
-
-    tool_calls = structured.get("tool_calls", []) if isinstance(structured, dict) else []
-    if tool_calls:
-        return {
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": tool_call.get("id", f"call_{idx}"),
-                    "name": tool_call["name"],
-                    "input": tool_call.get("arguments", {}),
-                }
-                for idx, tool_call in enumerate(tool_calls)
-                if isinstance(tool_call, dict) and tool_call.get("name")
-            ]
-        }
-
+    append_trace_row(task_id, condition, role, normalized["usage"], normalized["stop_reason"])
     return normalized
 
 
@@ -384,6 +481,9 @@ def main():
                     system=system_prompt,
                     messages=messages,
                     tools=make_studio_tools(),
+                    task_id=DEFAULT_TASK_ID,
+                    condition=DEFAULT_CONDITION,
+                    role="single",
                 )
                 content_blocks = response.get("content", [])
                 tool_results = []
