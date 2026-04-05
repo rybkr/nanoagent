@@ -24,7 +24,7 @@ load_dotenv()
 API_URL = os.environ.get(
     "GENAI_STUDIO_API_URL", "https://genai.rcac.purdue.edu/api/chat/completions"
 )
-API_KEY = os.environ.get("GENAI_STUDIO_API_KEY", "")
+API_KEY = os.environ.get("GENAI_STUDIO_API_KEY", os.environ.get("GENAI_STUDIO_API_KEY"))
 MODEL = os.environ.get("MODEL", os.environ.get("GENAI_STUDIO_MODEL", "llama3.1:latest"))
 
 # ANSI colors
@@ -291,7 +291,7 @@ def normalize_response(payload):
     return {"content": content}
 
 
-def call_api(messages, system_prompt):
+def call_api(model, max_tokens, system, messages, tools):
     if not API_KEY:
         raise RuntimeError("Missing GENAI_STUDIO_API_KEY")
 
@@ -303,10 +303,10 @@ def call_api(messages, system_prompt):
         API_URL,
         data=json.dumps(
             {
-                "model": MODEL,
-                "max_tokens": 8192,
-                "messages": convert_messages(system_prompt + fallback_prompt, messages),
-                "tools": make_studio_tools(),
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": convert_messages(system + fallback_prompt, messages),
+                "tools": tools,
             }
         ).encode(),
         headers={
@@ -378,7 +378,13 @@ def main():
 
             # agentic loop: keep calling API until no more tool calls
             while True:
-                response = call_api(messages, system_prompt)
+                response = call_api(
+                    model=MODEL,
+                    max_tokens=8192,
+                    system=system_prompt,
+                    messages=messages,
+                    tools=make_studio_tools(),
+                )
                 content_blocks = response.get("content", [])
                 tool_results = []
 
