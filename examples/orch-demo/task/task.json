@@ -1,0 +1,10 @@
+{
+  "task_id": "orch-demo-sub",
+  "repo_path": "../repo",
+  "test_command": "python3 -m unittest -q",
+  "file_budget": 1,
+  "allowed_files": ["calc.py"],
+  "max_planner_passes": 1,
+  "max_implementer_passes": 2,
+  "max_reviewer_passes": 1
+}
