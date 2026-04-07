@@ -125,11 +125,15 @@ def normalize_tool_args(tool_name, args, repo_path):
     if tool_name == "glob":
         if "pat" not in normalized:
             normalized["pat"] = normalized.get("pattern")
-        normalized["path"] = resolve_repo_path(repo_path, normalized.get("path", repo_path))
+        normalized["path"] = resolve_repo_path(
+            repo_path, normalized.get("path", repo_path)
+        )
     if tool_name == "grep":
         if "pat" not in normalized:
             normalized["pat"] = normalized.get("pattern", normalized.get("regex"))
-        normalized["path"] = resolve_repo_path(repo_path, normalized.get("path", repo_path))
+        normalized["path"] = resolve_repo_path(
+            repo_path, normalized.get("path", repo_path)
+        )
     if tool_name == "write" and "content" not in normalized:
         normalized["content"] = normalized.get("text")
     if tool_name == "edit":
@@ -230,7 +234,9 @@ def load_task_config(task_dir, model, condition):
             context_observation_limit=metadata.get("context_observation_limit", 8),
             max_diff_lines=metadata.get("max_diff_lines", 120),
             condition=condition,
-            task_id=metadata.get("task_id", os.path.basename(os.path.abspath(task_dir))),
+            task_id=metadata.get(
+                "task_id", os.path.basename(os.path.abspath(task_dir))
+            ),
             test_command=test_command,
             repo_path=repo_path,
             allowed_files=metadata.get("allowed_files", []),
@@ -428,7 +434,9 @@ def run_inspection(issue_text, repo_summary, plan, config):
         decision, last_raw = run_json_role(
             "inspector",
             f"Concise coding assistant. cwd: {os.getcwd()}",
-            inspector_prompt(issue_text, repo_summary, plan, observations, config, step),
+            inspector_prompt(
+                issue_text, repo_summary, plan, observations, config, step
+            ),
             config,
             {
                 "action": "done",

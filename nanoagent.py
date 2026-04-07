@@ -28,10 +28,11 @@ type ToolState = dict[str, object]
 API_URL = os.environ.get("API_URL")
 API_KEY = os.environ.get("API_KEY")
 MODEL = os.environ.get("MODEL")
+TOOL_MODE = os.environ.get("TOOL_MODE", "native").strip().lower()
 
-TRACE_PATH = Path(os.environ.get("NANOCODE_TRACE_PATH", "results/traces.jsonl"))
-DEFAULT_TASK_ID = os.environ.get("NANOCODE_TASK_ID", "interactive")
-DEFAULT_CONDITION = os.environ.get("NANOCODE_CONDITION", "single")
+TRACE_PATH = Path(os.environ.get("TRACE_PATH", "results/traces.jsonl"))
+DEFAULT_TASK_ID = os.environ.get("TASK_ID", "interactive")
+DEFAULT_CONDITION = os.environ.get("CONDITION", "single")
 TRACE_STATE: dict[str, int] = {"cumulative_total": 0}
 
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -587,12 +588,16 @@ def call_api(
 ) -> Response:
     if not API_KEY:
         raise RuntimeError("Missing API_KEY")
-    extra_instruction = (
-        "\n\nIf tool calling is unsupported and you need a tool, respond with JSON only: "
-        '{"tool_calls":[{"id":"call_1","name":"tool_name","arguments":{"arg":"value"}}]}.'
-        if tools
-        else ""
-    )
+    use_native_tools = bool(tools) and TOOL_MODE == "native"
+    extra_instruction = ""
+    if tools and not use_native_tools:
+        extra_instruction = (
+            "\n\nTool use is being emulated for this request. If you need a tool, respond "
+            "with JSON only in this shape: "
+            '{"assistant_text":"","tool_calls":[{"id":"call_1","name":"tool_name",'
+            '"arguments":{"arg":"value"}}]}. If you do not need a tool, respond with '
+            "normal assistant text."
+        )
     request = urllib.request.Request(
         API_URL,
         data=json.dumps(
@@ -603,7 +608,7 @@ def call_api(
                     system + extra_instruction,
                     messages,
                 ),
-                "tools": tools,
+                **({"tools": tools} if use_native_tools else {}),
             }
         ).encode(),
         headers={
@@ -645,86 +650,6 @@ def summarize_tool_output(tool_name: str, result: str) -> str:
     return result
 
 
-def format_tool_outputs(tool_outputs: list[tuple[str, str]]) -> str:
-    blocks = []
-    for i, (tool_name, result) in enumerate(tool_outputs, 1):
-        blocks.append(f"{i}. {tool_name}\n{summarize_tool_output(tool_name, result)}")
-    return "\n\n".join(blocks)
-
-
-def render_tool_outputs_for_user(tool_outputs: list[tuple[str, str]]) -> str:
-    if len(tool_outputs) == 1:
-        tool_name, result = tool_outputs[0]
-        if tool_name == "glob":
-            entries = [line.strip() for line in result.splitlines() if line.strip()]
-            if not entries or entries == ["none"]:
-                return "No matches."
-            return "\n".join(display_path(entry) for entry in entries)
-        if tool_name in {"read", "grep"}:
-            return result
-
-    parts = []
-    for tool_name, result in tool_outputs:
-        parts.append(f"{tool_name}:\n{summarize_tool_output(tool_name, result)}")
-    return "\n\n".join(parts)
-
-
-def force_plaintext_response(
-    user_input: str, tool_outputs: list[tuple[str, str]]
-) -> Response:
-    return call_api(
-        MODEL,
-        8192,
-        "You are a concise coding assistant. Tools are unavailable for this turn.",
-        [
-            {
-                "role": "user",
-                "content": (
-                    f"User request:\n{user_input}\n\n"
-                    f"Tool outputs so far:\n{format_tool_outputs(tool_outputs)}\n\n"
-                    "If the request can be answered now, answer in plain text for the "
-                    "user. Do not return JSON. Do not wrap the answer in quotes or "
-                    "braces. If more tool use is required, reply with exactly one line "
-                    "in this format: NEED_TOOL: <what additional information is needed>."
-                ),
-            }
-        ],
-        [],
-        DEFAULT_TASK_ID,
-        DEFAULT_CONDITION,
-        "single",
-    )
-
-
-def needs_plaintext_rewrite(text: str) -> bool:
-    stripped = text.strip()
-    return stripped.startswith("{") or stripped.startswith("[")
-
-
-def rewrite_plaintext_response(user_input: str, draft: str) -> str:
-    response = call_api(
-        MODEL,
-        1024,
-        "You are a concise coding assistant. Rewrite the draft as plain text.",
-        [
-            {
-                "role": "user",
-                "content": (
-                    f"User request:\n{user_input}\n\n"
-                    f"Draft answer:\n{draft}\n\n"
-                    "Rewrite this for the user in normal plain text. Do not return "
-                    "JSON. Do not use braces, quotes, or key/value formatting."
-                ),
-            }
-        ],
-        [],
-        DEFAULT_TASK_ID,
-        DEFAULT_CONDITION,
-        "single",
-    )
-    return response["assistant_text"] or extract_text(response.get("content", []))
-
-
 SYSTEM_PROMPT: str = f"""
 You are a concise coding assistant with tool access.
 
@@ -763,7 +688,6 @@ def main() -> None:
             last_mutations: dict[str, ToolState] = {}
             last_reads: dict[str, ToolState] = {}
             repeated_calls: dict[str, int] = {}
-            turn_tool_outputs: list[tuple[str, str]] = []
             while True:
                 response = call_api(
                     MODEL,
@@ -776,7 +700,7 @@ def main() -> None:
                     "single",
                 )
                 tool_results: list[dict[str, str]] = []
-                stop_after_response = False
+                halt_reason = None
                 for block in response["content"]:
                     if block["type"] == "text":
                         print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
@@ -793,7 +717,9 @@ def main() -> None:
                                 "error: tool iteration limit reached for this user "
                                 "request"
                             )
-                            stop_after_response = True
+                            halt_reason = (
+                                "Stopped after reaching the tool iteration limit"
+                            )
                         else:
                             result = enforce_tool_policy(
                                 tool_name,
@@ -805,8 +731,8 @@ def main() -> None:
                                 repeated_calls,
                             ) or run_tool(tool_name, tool_args)
                         if result.startswith("error: repeated identical"):
-                            stop_after_response = True
-                        verified_complete = update_tool_state(
+                            halt_reason = "Stopped after a repeated identical tool request was blocked"
+                        update_tool_state(
                             tool_name,
                             tool_args,
                             result,
@@ -816,8 +742,6 @@ def main() -> None:
                             last_reads,
                             repeated_calls,
                         )
-                        if verified_complete:
-                            stop_after_response = True
                         lines = result.splitlines() or [result]
                         preview = lines[0][:60]
                         if len(lines) > 1:
@@ -825,11 +749,6 @@ def main() -> None:
                         elif len(lines[0]) > 60:
                             preview += "..."
                         print(f"  {DIM}⎿  {preview}{RESET}")
-                        if verified_complete:
-                            print(
-                                f"\n{CYAN}⏺{RESET} Verified; request appears satisfied."
-                            )
-                        turn_tool_outputs.append((tool_name, result))
                         tool_results.append(
                             {
                                 "type": "tool_result",
@@ -842,24 +761,9 @@ def main() -> None:
                     messages.append({"role": "user", "content": tool_results})
                 if not tool_results:
                     break
-                final_response = force_plaintext_response(user_input, turn_tool_outputs)
-                final_text = final_response["assistant_text"] or extract_text(
-                    final_response.get("content", [])
-                )
-                if final_text and needs_plaintext_rewrite(final_text):
-                    rewritten = rewrite_plaintext_response(user_input, final_text)
-                    if rewritten:
-                        final_text = rewritten
-                messages.append(
-                    {"role": "assistant", "content": final_response["content"]}
-                )
-                if final_text.startswith("NEED_TOOL:") and not stop_after_response:
-                    print(f"\n{CYAN}⏺{RESET} {render_markdown(final_text)}")
-                    continue
-                if not final_text or needs_plaintext_rewrite(final_text):
-                    final_text = render_tool_outputs_for_user(turn_tool_outputs)
-                print(f"\n{CYAN}⏺{RESET} {render_markdown(final_text)}")
-                break
+                if halt_reason:
+                    print(f"\n{CYAN}⏺{RESET} {halt_reason}.")
+                    break
             print()
         except (KeyboardInterrupt, EOFError):
             break
