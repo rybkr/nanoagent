@@ -258,8 +258,10 @@ def user_requested_direct_write(user_input: str, path: Path) -> bool:
     )
     if any(phrase in request for phrase in explicit_phrases):
         return True
-    return "write" in request and " to " in request and (
-        path.name.lower() in request or path_text in request
+    return (
+        "write" in request
+        and " to " in request
+        and (path.name.lower() in request or path_text in request)
     )
 
 
@@ -363,9 +365,9 @@ def update_tool_state(
             if isinstance(last_mutation, dict)
             else None
         )
-        return isinstance(expected_content, str) and expected_content == normalize_read_output(
-            result
-        )
+        return isinstance(
+            expected_content, str
+        ) and expected_content == normalize_read_output(result)
     if tool_name in {"write", "edit"}:
         last_mutations[path_key] = {
             "step": step,
@@ -586,7 +588,7 @@ def call_api(
     if not API_KEY:
         raise RuntimeError("Missing API_KEY")
     extra_instruction = (
-        '\n\nIf tool calling is unsupported and you need a tool, respond with JSON only: '
+        "\n\nIf tool calling is unsupported and you need a tool, respond with JSON only: "
         '{"tool_calls":[{"id":"call_1","name":"tool_name","arguments":{"arg":"value"}}]}.'
         if tools
         else ""
