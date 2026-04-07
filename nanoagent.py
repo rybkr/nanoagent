@@ -36,7 +36,8 @@ TRACE_STATE: dict[str, int] = {"cumulative_total": 0}
 
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
 BLUE, CYAN, GREEN, RED = "\033[34m", "\033[36m", "\033[32m", "\033[31m"
-MAX_TOOL_ITERATIONS = 25
+MAX_TOOL_ITERATIONS = 12
+MAX_IDENTICAL_TOOL_CALLS = 2
 
 
 def get_required_str(args: JSONObject, key: str) -> str:
@@ -67,7 +68,7 @@ def write(args: JSONObject) -> str:
     content: str = get_required_str(args, "content")
     path = Path(get_required_str(args, "path"))
     path.write_text(content)
-    return f"Successfully wrote {content} to {path}" 
+    return f"Wrote '{content}' to {path}"
 
 
 def edit(args: JSONObject) -> str:
@@ -87,7 +88,10 @@ def edit(args: JSONObject) -> str:
 
 
 def glob_files(args: JSONObject) -> str:
-    pattern = str(Path(args.get("path") or ".") / get_required_str(args, "pat"))
+    pat = get_required_str(args, "pat").strip()
+    if not pat:
+        return "error: pat must be a non-empty glob pattern"
+    pattern = str(Path(args.get("path") or ".") / pat)
     files = globlib.glob(pattern, recursive=True)
     files.sort(
         key=lambda match: Path(match).stat().st_mtime if Path(match).is_file() else 0,
@@ -97,7 +101,10 @@ def glob_files(args: JSONObject) -> str:
 
 
 def grep_files(args: JSONObject) -> str:
-    pattern = re.compile(get_required_str(args, "pat"))
+    pat = get_required_str(args, "pat").strip()
+    if not pat:
+        return "error: pat must be a non-empty regex pattern"
+    pattern = re.compile(pat)
     hits: list[str] = []
     for match in globlib.glob(
         str(Path(args.get("path") or ".") / "**"), recursive=True
@@ -156,7 +163,7 @@ TOOLS: dict[str, ToolSpec] = {
         edit,
     ),
     "glob": (
-        "Find files by pattern, sorted by mtime",
+        "Find files by glob pattern, sorted by mtime. For listing a directory, use pat='*' and path='.'.",
         {"pat": "string", "path": "string?"},
         glob_files,
     ),
@@ -165,7 +172,11 @@ TOOLS: dict[str, ToolSpec] = {
         {"pat": "string", "path": "string?"},
         grep_files,
     ),
-    "bash": ("Run shell command", {"cmd": "string"}, run_bash),
+    "bash": (
+        "Run a shell command only when read, glob, or grep cannot do the job. Avoid bash for simple file listing or searching.",
+        {"cmd": "string"},
+        run_bash,
+    ),
 }
 
 
@@ -208,7 +219,7 @@ def make_studio_tools() -> list[dict[str, object]]:
 
 
 def get_tool_path(name: str, args: JSONObject) -> Path | None:
-    if name not in {"read", "write", "edit"}:
+    if name not in {"read", "write", "edit", "glob", "grep"}:
         return None
     path = args.get("path")
     return Path(path).resolve() if isinstance(path, str) else None
@@ -259,7 +270,15 @@ def enforce_tool_policy(
     last_read_steps: dict[str, int],
     last_mutations: dict[str, ToolState],
     last_reads: dict[str, ToolState],
+    repeated_calls: dict[str, int],
 ) -> str | None:
+    signature = make_tool_signature(tool_name, tool_args)
+    if repeated_calls.get(signature, 0) >= MAX_IDENTICAL_TOOL_CALLS:
+        return (
+            f"error: repeated identical {tool_name} blocked; use the existing result "
+            "or choose a different action"
+        )
+
     path = get_tool_path(tool_name, tool_args)
     if path is None:
         return None
@@ -272,7 +291,6 @@ def enforce_tool_policy(
         if last_mutation and isinstance(last_mutation.get("step"), int)
         else -1
     )
-    signature = make_tool_signature(tool_name, tool_args)
 
     if (
         tool_name == "write"
@@ -319,7 +337,11 @@ def update_tool_state(
     last_read_steps: dict[str, int],
     last_mutations: dict[str, ToolState],
     last_reads: dict[str, ToolState],
+    repeated_calls: dict[str, int],
 ) -> bool:
+    signature = make_tool_signature(tool_name, tool_args)
+    repeated_calls[signature] = repeated_calls.get(signature, 0) + 1
+
     path = get_tool_path(tool_name, tool_args)
     if path is None or result.startswith("error:"):
         return False
@@ -329,7 +351,7 @@ def update_tool_state(
         last_read_steps[path_key] = step
         last_reads[path_key] = {
             "step": step,
-            "signature": make_tool_signature(tool_name, tool_args),
+            "signature": signature,
             "content": normalize_read_output(result),
             "step_after_mutation": (
                 last_mutations[path_key]["step"] if path_key in last_mutations else -1
@@ -344,10 +366,10 @@ def update_tool_state(
         return isinstance(expected_content, str) and expected_content == normalize_read_output(
             result
         )
-    elif tool_name in {"write", "edit"}:
+    if tool_name in {"write", "edit"}:
         last_mutations[path_key] = {
             "step": step,
-            "signature": make_tool_signature(tool_name, tool_args),
+            "signature": signature,
             "expected_content": (
                 get_required_str(tool_args, "content")
                 if tool_name == "write"
@@ -541,6 +563,16 @@ def append_trace_row(
         handle.write(json.dumps(row) + "\n")
 
 
+def extract_text(content_blocks: list[dict[str, object]]) -> str:
+    return "\n".join(
+        block["text"]
+        for block in content_blocks
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ).strip()
+
+
 def call_api(
     model: str | None,
     max_tokens: int,
@@ -552,7 +584,13 @@ def call_api(
     role: str = "single",
 ) -> Response:
     if not API_KEY:
-        raise RuntimeError("Missing GENAI_STUDIO_API_KEY")
+        raise RuntimeError("Missing API_KEY")
+    extra_instruction = (
+        '\n\nIf tool calling is unsupported and you need a tool, respond with JSON only: '
+        '{"tool_calls":[{"id":"call_1","name":"tool_name","arguments":{"arg":"value"}}]}.'
+        if tools
+        else ""
+    )
     request = urllib.request.Request(
         API_URL,
         data=json.dumps(
@@ -560,7 +598,7 @@ def call_api(
                 "model": model,
                 "max_tokens": max_tokens,
                 "messages": convert_messages(
-                    system,
+                    system + extra_instruction,
                     messages,
                 ),
                 "tools": tools,
@@ -588,26 +626,116 @@ def render_markdown(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
 
 
+def display_path(path_text: str) -> str:
+    try:
+        path = Path(path_text)
+        return str(path.relative_to(Path.cwd())) if path.is_absolute() else path_text
+    except ValueError:
+        return path_text
+
+
+def summarize_tool_output(tool_name: str, result: str) -> str:
+    if tool_name == "glob":
+        entries = [line.strip() for line in result.splitlines() if line.strip()]
+        if not entries or entries == ["none"]:
+            return "Matches:\n- none"
+        return "Matches:\n" + "\n".join(f"- {display_path(entry)}" for entry in entries)
+    return result
+
+
+def format_tool_outputs(tool_outputs: list[tuple[str, str]]) -> str:
+    blocks = []
+    for i, (tool_name, result) in enumerate(tool_outputs, 1):
+        blocks.append(f"{i}. {tool_name}\n{summarize_tool_output(tool_name, result)}")
+    return "\n\n".join(blocks)
+
+
+def render_tool_outputs_for_user(tool_outputs: list[tuple[str, str]]) -> str:
+    if len(tool_outputs) == 1:
+        tool_name, result = tool_outputs[0]
+        if tool_name == "glob":
+            entries = [line.strip() for line in result.splitlines() if line.strip()]
+            if not entries or entries == ["none"]:
+                return "No matches."
+            return "\n".join(display_path(entry) for entry in entries)
+        if tool_name in {"read", "grep"}:
+            return result
+
+    parts = []
+    for tool_name, result in tool_outputs:
+        parts.append(f"{tool_name}:\n{summarize_tool_output(tool_name, result)}")
+    return "\n\n".join(parts)
+
+
+def force_plaintext_response(
+    user_input: str, tool_outputs: list[tuple[str, str]]
+) -> Response:
+    return call_api(
+        MODEL,
+        8192,
+        "You are a concise coding assistant. Tools are unavailable for this turn.",
+        [
+            {
+                "role": "user",
+                "content": (
+                    f"User request:\n{user_input}\n\n"
+                    f"Tool outputs so far:\n{format_tool_outputs(tool_outputs)}\n\n"
+                    "If the request can be answered now, answer in plain text for the "
+                    "user. Do not return JSON. Do not wrap the answer in quotes or "
+                    "braces. If more tool use is required, reply with exactly one line "
+                    "in this format: NEED_TOOL: <what additional information is needed>."
+                ),
+            }
+        ],
+        [],
+        DEFAULT_TASK_ID,
+        DEFAULT_CONDITION,
+        "single",
+    )
+
+
+def needs_plaintext_rewrite(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.startswith("{") or stripped.startswith("[")
+
+
+def rewrite_plaintext_response(user_input: str, draft: str) -> str:
+    response = call_api(
+        MODEL,
+        1024,
+        "You are a concise coding assistant. Rewrite the draft as plain text.",
+        [
+            {
+                "role": "user",
+                "content": (
+                    f"User request:\n{user_input}\n\n"
+                    f"Draft answer:\n{draft}\n\n"
+                    "Rewrite this for the user in normal plain text. Do not return "
+                    "JSON. Do not use braces, quotes, or key/value formatting."
+                ),
+            }
+        ],
+        [],
+        DEFAULT_TASK_ID,
+        DEFAULT_CONDITION,
+        "single",
+    )
+    return response["assistant_text"] or extract_text(response.get("content", []))
+
+
 SYSTEM_PROMPT: str = f"""
 You are a concise coding assistant with tool access.
 
 Operate with this protocol:
-1. If the user explicitly asks to create a new file or fully overwrite a file, call write directly.
-2. If the user asks to modify an existing file and the final contents are not fully specified, read the file before editing or writing.
-3. After a successful write or edit, read the file once to verify the result when verification is useful.
-4. If the read result confirms the user's request has been satisfied, stop calling tools and respond with a short completion message.
-5. Do not repeat the same write or edit with the same arguments after a successful result unless a read showed the file is still wrong.
-6. Do not repeat a tool call that already failed with the same arguments; choose a different action.
-7. Prefer the minimum number of tool calls needed to complete the task.
-
-Important completion rule:
-If the latest successful tool result or verification read already satisfies the user's request, you are done. Do not call another tool.
-
-If tool calling is unsupported and you need a tool, respond with JSON only in this form:
-{{"tool_calls":[{{"id":"call_1","name":"tool_name","arguments":{{"arg":"value"}}}}]}}
+1. If a tool result already answers the user's request, stop using tools and answer.
+2. Never repeat an identical tool call after a successful result.
+3. Prefer the minimum number of tool calls needed to complete the task.
+4. Read before editing existing files unless the user explicitly asked to overwrite them.
+5. Prefer read, glob, and grep over bash whenever they can accomplish the task.
 
 cwd: {os.getcwd()}
 """
+
 
 def main() -> None:
     print(
@@ -632,6 +760,8 @@ def main() -> None:
             last_read_steps: dict[str, int] = {}
             last_mutations: dict[str, ToolState] = {}
             last_reads: dict[str, ToolState] = {}
+            repeated_calls: dict[str, int] = {}
+            turn_tool_outputs: list[tuple[str, str]] = []
             while True:
                 response = call_api(
                     MODEL,
@@ -670,6 +800,7 @@ def main() -> None:
                                 last_read_steps,
                                 last_mutations,
                                 last_reads,
+                                repeated_calls,
                             ) or run_tool(tool_name, tool_args)
                         if result.startswith("error: repeated identical"):
                             stop_after_response = True
@@ -681,6 +812,7 @@ def main() -> None:
                             last_read_steps,
                             last_mutations,
                             last_reads,
+                            repeated_calls,
                         )
                         if verified_complete:
                             stop_after_response = True
@@ -695,6 +827,7 @@ def main() -> None:
                             print(
                                 f"\n{CYAN}⏺{RESET} Verified; request appears satisfied."
                             )
+                        turn_tool_outputs.append((tool_name, result))
                         tool_results.append(
                             {
                                 "type": "tool_result",
@@ -703,9 +836,28 @@ def main() -> None:
                             }
                         )
                 messages.append({"role": "assistant", "content": response["content"]})
-                if not tool_results or stop_after_response:
+                if tool_results:
+                    messages.append({"role": "user", "content": tool_results})
+                if not tool_results:
                     break
-                messages.append({"role": "user", "content": tool_results})
+                final_response = force_plaintext_response(user_input, turn_tool_outputs)
+                final_text = final_response["assistant_text"] or extract_text(
+                    final_response.get("content", [])
+                )
+                if final_text and needs_plaintext_rewrite(final_text):
+                    rewritten = rewrite_plaintext_response(user_input, final_text)
+                    if rewritten:
+                        final_text = rewritten
+                messages.append(
+                    {"role": "assistant", "content": final_response["content"]}
+                )
+                if final_text.startswith("NEED_TOOL:") and not stop_after_response:
+                    print(f"\n{CYAN}⏺{RESET} {render_markdown(final_text)}")
+                    continue
+                if not final_text or needs_plaintext_rewrite(final_text):
+                    final_text = render_tool_outputs_for_user(turn_tool_outputs)
+                print(f"\n{CYAN}⏺{RESET} {render_markdown(final_text)}")
+                break
             print()
         except (KeyboardInterrupt, EOFError):
             break
