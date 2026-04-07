@@ -2,6 +2,7 @@
 """nanoagent - minimal claude code alternative"""
 
 from collections.abc import Callable
+from datetime import datetime
 import glob as globlib
 import json
 import os
@@ -33,7 +34,13 @@ TOOL_MODE = os.environ.get("TOOL_MODE", "native").strip().lower()
 TRACE_PATH = Path(os.environ.get("TRACE_PATH", "results/traces.jsonl"))
 DEFAULT_TASK_ID = os.environ.get("TASK_ID", "interactive")
 DEFAULT_CONDITION = os.environ.get("CONDITION", "single")
-TRACE_STATE: dict[str, int] = {"cumulative_total": 0}
+TRACE_STATE: dict[str, int] = {
+    "cumulative_total": 0,
+    "last_input_tokens": 0,
+    "last_output_tokens": 0,
+    "last_total_tokens": 0,
+    "call_count": 0,
+}
 
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
 BLUE, CYAN, GREEN, RED = "\033[34m", "\033[36m", "\033[32m", "\033[31m"
@@ -552,6 +559,10 @@ def append_trace_row(
 ) -> None:
     TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
     TRACE_STATE["cumulative_total"] += usage["total_tokens"]
+    TRACE_STATE["last_input_tokens"] = usage["input_tokens"]
+    TRACE_STATE["last_output_tokens"] = usage["output_tokens"]
+    TRACE_STATE["last_total_tokens"] = usage["total_tokens"]
+    TRACE_STATE["call_count"] += 1
     row = {
         "task_id": task_id,
         "condition": condition,
@@ -629,6 +640,16 @@ def separator() -> str:
     return f"{DIM}{'─' * width}{RESET}"
 
 
+def status_line() -> str:
+    clock = datetime.now().strftime("%H:%M:%S")
+    return (
+        f"{DIM}[{clock}] API calls: {TRACE_STATE['call_count']} | "
+        f"Last tokens in/out/total: {TRACE_STATE['last_input_tokens']}/"
+        f"{TRACE_STATE['last_output_tokens']}/{TRACE_STATE['last_total_tokens']} | "
+        f"Session tokens: {TRACE_STATE['cumulative_total']}{RESET}"
+    )
+
+
 def render_markdown(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
 
@@ -671,6 +692,7 @@ def main() -> None:
     messages: list[Message] = []
     while True:
         try:
+            print(status_line())
             print(separator())
             user_input = input(f"{BOLD}{BLUE}❯{RESET} ").strip()
             print(separator())
@@ -699,6 +721,7 @@ def main() -> None:
                     DEFAULT_CONDITION,
                     "single",
                 )
+                print(status_line())
                 tool_results: list[dict[str, str]] = []
                 halt_reason = None
                 for block in response["content"]:
