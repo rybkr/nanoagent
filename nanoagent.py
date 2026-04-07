@@ -23,6 +23,7 @@ type ToolSpec = tuple[str, dict[str, str], Callable[[JSONObject], str]]
 type Message = dict[str, object]
 type Response = dict[str, object]
 type Usage = dict[str, int]
+type ToolState = dict[str, int | str]
 
 API_URL = os.environ.get("API_URL")
 API_KEY = os.environ.get("API_KEY")
@@ -35,6 +36,7 @@ TRACE_STATE: dict[str, int] = {"cumulative_total": 0}
 
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
 BLUE, CYAN, GREEN, RED = "\033[34m", "\033[36m", "\033[32m", "\033[31m"
+MAX_TOOL_ITERATIONS = 25
 
 
 def get_required_str(args: JSONObject, key: str) -> str:
@@ -63,8 +65,9 @@ def read(args: JSONObject) -> str:
 
 def write(args: JSONObject) -> str:
     content: str = get_required_str(args, "content")
-    Path(get_required_str(args, "path")).write_text(content)
-    return content
+    path = Path(get_required_str(args, "path"))
+    path.write_text(content)
+    return f"Successfully wrote {content} to {path}" 
 
 
 def edit(args: JSONObject) -> str:
@@ -202,6 +205,111 @@ def make_studio_tools() -> list[dict[str, object]]:
             }
         )
     return tools
+
+
+def get_tool_path(name: str, args: JSONObject) -> Path | None:
+    if name not in {"read", "write", "edit"}:
+        return None
+    path = args.get("path")
+    return Path(path).resolve() if isinstance(path, str) else None
+
+
+def make_tool_signature(name: str, args: JSONObject) -> str:
+    normalized_args = dict(args)
+    path = get_tool_path(name, args)
+    if path is not None:
+        normalized_args["path"] = str(path)
+    return json.dumps(
+        {"name": name, "arguments": normalized_args},
+        sort_keys=True,
+    )
+
+
+def user_requested_direct_write(user_input: str, path: Path) -> bool:
+    request = user_input.lower()
+    path_text = str(path).lower()
+    explicit_phrases = (
+        "create",
+        "overwrite",
+        "replace",
+        "rewrite",
+        "truncate",
+        "new file",
+        "from scratch",
+    )
+    if any(phrase in request for phrase in explicit_phrases):
+        return True
+    return "write" in request and " to " in request and (
+        path.name.lower() in request or path_text in request
+    )
+
+
+def enforce_tool_policy(
+    tool_name: str,
+    tool_args: JSONObject,
+    user_input: str,
+    last_read_steps: dict[str, int],
+    last_mutations: dict[str, ToolState],
+) -> str | None:
+    path = get_tool_path(tool_name, tool_args)
+    if path is None:
+        return None
+
+    path_key = str(path)
+    last_read_step = last_read_steps.get(path_key, -1)
+    last_mutation = last_mutations.get(path_key)
+    last_mutation_step = (
+        last_mutation["step"]
+        if last_mutation and isinstance(last_mutation.get("step"), int)
+        else -1
+    )
+    signature = make_tool_signature(tool_name, tool_args)
+
+    if (
+        tool_name == "write"
+        and path.exists()
+        and last_read_step <= last_mutation_step
+        and not user_requested_direct_write(user_input, path)
+    ):
+        return (
+            f"error: read {tool_args.get('path', path.name)} before writing it unless "
+            "the user explicitly asked to create or overwrite the file"
+        )
+
+    if (
+        tool_name in {"write", "edit"}
+        and last_mutation
+        and last_mutation.get("signature") == signature
+        and last_read_step <= last_mutation_step
+    ):
+        return (
+            f"error: repeated identical {tool_name} blocked for "
+            f"{tool_args.get('path', path.name)}; read the file before retrying"
+        )
+
+    return None
+
+
+def update_tool_state(
+    tool_name: str,
+    tool_args: JSONObject,
+    result: str,
+    step: int,
+    last_read_steps: dict[str, int],
+    last_mutations: dict[str, ToolState],
+) -> None:
+    path = get_tool_path(tool_name, tool_args)
+    if path is None or result.startswith("error:"):
+        return
+
+    path_key = str(path)
+    if tool_name == "read":
+        last_read_steps[path_key] = step
+    elif tool_name in {"write", "edit"}:
+        last_mutations[path_key] = {
+            "step": step,
+            "signature": make_tool_signature(tool_name, tool_args),
+        }
 
 
 def convert_messages(system_prompt: str, messages: list[Message]) -> list[Message]:
@@ -400,8 +508,7 @@ def call_api(
                 "model": model,
                 "max_tokens": max_tokens,
                 "messages": convert_messages(
-                    system
-                    + '\n\nIf tool calling is unsupported and you need a tool, respond with JSON only: {"tool_calls":[{"id":"call_1","name":"tool_name","arguments":{"arg":"value"}}]}.',
+                    system,
                     messages,
                 ),
                 "tools": tools,
@@ -429,12 +536,32 @@ def render_markdown(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
 
 
+SYSTEM_PROMPT: str = f"""
+You are a concise coding assistant with tool access.
+
+Operate with this protocol:
+1. If the user explicitly asks to create a new file or fully overwrite a file, call write directly.
+2. If the user asks to modify an existing file and the final contents are not fully specified, read the file before editing or writing.
+3. After a successful write or edit, read the file once to verify the result when verification is useful.
+4. If the read result confirms the user's request has been satisfied, stop calling tools and respond with a short completion message.
+5. Do not repeat the same write or edit with the same arguments after a successful result unless a read showed the file is still wrong.
+6. Do not repeat a tool call that already failed with the same arguments; choose a different action.
+7. Prefer the minimum number of tool calls needed to complete the task.
+
+Important completion rule:
+If the latest successful tool result or verification read already satisfies the user's request, you are done. Do not call another tool.
+
+If tool calling is unsupported and you need a tool, respond with JSON only in this form:
+{{"tool_calls":[{{"id":"call_1","name":"tool_name","arguments":{{"arg":"value"}}}}]}}
+
+cwd: {os.getcwd()}
+"""
+
 def main() -> None:
     print(
         f"{BOLD}nanoagent{RESET} | {DIM}{MODEL} (GenAI Studio) | {os.getcwd()}{RESET}\n"
     )
     messages: list[Message] = []
-    system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
     while True:
         try:
             print(separator())
@@ -449,11 +576,14 @@ def main() -> None:
                 print(f"{GREEN}⏺ Cleared conversation{RESET}")
                 continue
             messages.append({"role": "user", "content": user_input})
+            tool_step = 0
+            last_read_steps: dict[str, int] = {}
+            last_mutations: dict[str, ToolState] = {}
             while True:
                 response = call_api(
                     MODEL,
                     8192,
-                    system_prompt,
+                    SYSTEM_PROMPT,
                     messages,
                     make_studio_tools(),
                     DEFAULT_TASK_ID,
@@ -461,17 +591,40 @@ def main() -> None:
                     "single",
                 )
                 tool_results: list[dict[str, str]] = []
+                stop_after_response = False
                 for block in response["content"]:
                     if block["type"] == "text":
                         print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
                     elif block["type"] == "tool_use":
+                        tool_step += 1
                         tool_name = block["name"]
                         tool_args = block["input"]
                         arg_preview = str(next(iter(tool_args.values()), ""))[:50]
                         print(
                             f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
                         )
-                        result = run_tool(tool_name, tool_args)
+                        if tool_step > MAX_TOOL_ITERATIONS:
+                            result = (
+                                "error: tool iteration limit reached for this user "
+                                "request"
+                            )
+                            stop_after_response = True
+                        else:
+                            result = enforce_tool_policy(
+                                tool_name,
+                                tool_args,
+                                user_input,
+                                last_read_steps,
+                                last_mutations,
+                            ) or run_tool(tool_name, tool_args)
+                        update_tool_state(
+                            tool_name,
+                            tool_args,
+                            result,
+                            tool_step,
+                            last_read_steps,
+                            last_mutations,
+                        )
                         lines = result.splitlines() or [result]
                         preview = lines[0][:60]
                         if len(lines) > 1:
@@ -487,7 +640,7 @@ def main() -> None:
                             }
                         )
                 messages.append({"role": "assistant", "content": response["content"]})
-                if not tool_results:
+                if not tool_results or stop_after_response:
                     break
                 messages.append({"role": "user", "content": tool_results})
             print()
