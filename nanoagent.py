@@ -23,7 +23,7 @@ type ToolSpec = tuple[str, dict[str, str], Callable[[JSONObject], str]]
 type Message = dict[str, object]
 type Response = dict[str, object]
 type Usage = dict[str, int]
-type ToolState = dict[str, int | str]
+type ToolState = dict[str, object]
 
 API_URL = os.environ.get("API_URL")
 API_KEY = os.environ.get("API_KEY")
@@ -225,6 +225,14 @@ def make_tool_signature(name: str, args: JSONObject) -> str:
     )
 
 
+def normalize_read_output(result: str) -> str:
+    lines: list[str] = []
+    for line in result.splitlines():
+        match = re.match(r"^\s*\d+\| ?", line)
+        lines.append(re.sub(r"^\s*\d+\| ?", "", line) if match else line)
+    return "\n".join(lines)
+
+
 def user_requested_direct_write(user_input: str, path: Path) -> bool:
     request = user_input.lower()
     path_text = str(path).lower()
@@ -250,6 +258,7 @@ def enforce_tool_policy(
     user_input: str,
     last_read_steps: dict[str, int],
     last_mutations: dict[str, ToolState],
+    last_reads: dict[str, ToolState],
 ) -> str | None:
     path = get_tool_path(tool_name, tool_args)
     if path is None:
@@ -287,6 +296,18 @@ def enforce_tool_policy(
             f"{tool_args.get('path', path.name)}; read the file before retrying"
         )
 
+    if tool_name == "read":
+        last_read = last_reads.get(path_key)
+        if (
+            last_read
+            and last_read.get("signature") == signature
+            and last_read.get("step_after_mutation") == last_mutation_step
+        ):
+            return (
+                f"error: repeated identical read blocked for "
+                f"{tool_args.get('path', path.name)}; choose a different action"
+            )
+
     return None
 
 
@@ -297,19 +318,43 @@ def update_tool_state(
     step: int,
     last_read_steps: dict[str, int],
     last_mutations: dict[str, ToolState],
-) -> None:
+    last_reads: dict[str, ToolState],
+) -> bool:
     path = get_tool_path(tool_name, tool_args)
     if path is None or result.startswith("error:"):
-        return
+        return False
 
     path_key = str(path)
     if tool_name == "read":
         last_read_steps[path_key] = step
+        last_reads[path_key] = {
+            "step": step,
+            "signature": make_tool_signature(tool_name, tool_args),
+            "content": normalize_read_output(result),
+            "step_after_mutation": (
+                last_mutations[path_key]["step"] if path_key in last_mutations else -1
+            ),
+        }
+        last_mutation = last_mutations.get(path_key)
+        expected_content = (
+            last_mutation.get("expected_content")
+            if isinstance(last_mutation, dict)
+            else None
+        )
+        return isinstance(expected_content, str) and expected_content == normalize_read_output(
+            result
+        )
     elif tool_name in {"write", "edit"}:
         last_mutations[path_key] = {
             "step": step,
             "signature": make_tool_signature(tool_name, tool_args),
+            "expected_content": (
+                get_required_str(tool_args, "content")
+                if tool_name == "write"
+                else result
+            ),
         }
+    return False
 
 
 def convert_messages(system_prompt: str, messages: list[Message]) -> list[Message]:
@@ -418,13 +463,20 @@ def extract_structured_response(text: object) -> tuple[str, list[dict[str, objec
         if not isinstance(tool_call, dict):
             continue
         name = tool_call.get("name")
+        arguments: object = tool_call.get("arguments", {})
+        if not isinstance(name, str):
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            arguments = function.get("arguments", {})
         if not isinstance(name, str):
             continue
         tool_calls.append(
             {
                 "id": tool_call.get("id", f"call_{i}"),
                 "name": name,
-                "arguments": parse_tool_arguments(tool_call.get("arguments", {})),
+                "arguments": parse_tool_arguments(arguments),
             }
         )
     assistant_text = payload.get("assistant_text")
@@ -579,6 +631,7 @@ def main() -> None:
             tool_step = 0
             last_read_steps: dict[str, int] = {}
             last_mutations: dict[str, ToolState] = {}
+            last_reads: dict[str, ToolState] = {}
             while True:
                 response = call_api(
                     MODEL,
@@ -616,15 +669,21 @@ def main() -> None:
                                 user_input,
                                 last_read_steps,
                                 last_mutations,
+                                last_reads,
                             ) or run_tool(tool_name, tool_args)
-                        update_tool_state(
+                        if result.startswith("error: repeated identical"):
+                            stop_after_response = True
+                        verified_complete = update_tool_state(
                             tool_name,
                             tool_args,
                             result,
                             tool_step,
                             last_read_steps,
                             last_mutations,
+                            last_reads,
                         )
+                        if verified_complete:
+                            stop_after_response = True
                         lines = result.splitlines() or [result]
                         preview = lines[0][:60]
                         if len(lines) > 1:
@@ -632,6 +691,10 @@ def main() -> None:
                         elif len(lines[0]) > 60:
                             preview += "..."
                         print(f"  {DIM}⎿  {preview}{RESET}")
+                        if verified_complete:
+                            print(
+                                f"\n{CYAN}⏺{RESET} Verified; request appears satisfied."
+                            )
                         tool_results.append(
                             {
                                 "type": "tool_result",
