@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """nanoagent - minimal claude code alternative"""
 
-from collections.abc import Callable
-from datetime import datetime
+# Import
 import glob as globlib
 import json
 import os
@@ -10,7 +9,11 @@ import re
 import shutil
 import subprocess
 import urllib.error
+import traceback
+import argparse
 import urllib.request
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -19,8 +22,10 @@ except ModuleNotFoundError:
     def load_dotenv() -> None:
         return None
 
+# This will load in the environment from .env to be used by module constants
 load_dotenv()
 
+# Type definitions
 type JSONValue = (
     str | int | float | bool | None | list["JSONValue"] | dict[str, "JSONValue"]
 )
@@ -31,6 +36,7 @@ type Response = dict[str, object]
 type Usage = dict[str, int]
 type ToolState = dict[str, object]
 
+# Constants
 STUDIO_API_URL = os.environ.get(
     "STUDIO_API_URL",
     os.environ.get("API_URL", "https://genai.rcac.purdue.edu/api/chat/completions"),
@@ -56,14 +62,16 @@ TRACE_STATE: dict[str, int] = {
     "last_total_tokens": 0,
     "call_count": 0,
 }
-
-RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
-BLUE, CYAN, GREEN, RED = "\033[34m", "\033[36m", "\033[32m", "\033[31m"
 MAX_TOOL_ITERATIONS = 12
 MAX_IDENTICAL_TOOL_CALLS = 2
 
+## Terminal formatting
+RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+BLUE, CYAN, GREEN, RED = "\033[34m", "\033[36m", "\033[32m", "\033[31m"
+
 
 def get_required_str(args: JSONObject, key: str) -> str:
+    """Check which args are required"""
     value = args.get(key)
     if not isinstance(value, str):
         raise ValueError(f"missing or invalid {key}")
@@ -71,13 +79,20 @@ def get_required_str(args: JSONObject, key: str) -> str:
 
 
 def get_optional_int(value: object, default: int = 0) -> int:
+    """Handle a type conversion to int"""
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
 
 
+def return_to_user(args: JSONObject) -> str:
+    """Tool to provide to model to explicitly call when execution is done"""
+    return ""
+
+
 def read(args: JSONObject) -> str:
+    """Read a file contents into a single string"""
     lines = Path(get_required_str(args, "path")).read_text().splitlines(keepends=True)
     offset = get_optional_int(args.get("offset"))
     limit = get_optional_int(args.get("limit"), len(lines))
@@ -88,6 +103,7 @@ def read(args: JSONObject) -> str:
 
 
 def write(args: JSONObject) -> str:
+    """Tool: Write contents into a file"""
     content: str = get_required_str(args, "content")
     path = Path(get_required_str(args, "path"))
     path.write_text(content)
@@ -95,6 +111,7 @@ def write(args: JSONObject) -> str:
 
 
 def edit(args: JSONObject) -> str:
+    """Tool: Make edits to an existing file"""
     path = Path(get_required_str(args, "path"))
     text = path.read_text()
     old = get_required_str(args, "old")
@@ -111,6 +128,7 @@ def edit(args: JSONObject) -> str:
 
 
 def glob_files(args: JSONObject) -> str:
+    """Tool: Resolve a path glob"""
     pat = get_required_str(args, "pat").strip()
     if not pat:
         return "error: pat must be a non-empty glob pattern"
@@ -124,6 +142,7 @@ def glob_files(args: JSONObject) -> str:
 
 
 def grep_files(args: JSONObject) -> str:
+    """Tool: Search file content with regex matching"""
     pat = get_required_str(args, "pat").strip()
     if not pat:
         return "error: pat must be a non-empty regex pattern"
@@ -146,6 +165,7 @@ def grep_files(args: JSONObject) -> str:
 
 
 def run_bash(args: JSONObject) -> str:
+    """Tool: Run a bash command"""
     proc = subprocess.Popen(
         get_required_str(args, "cmd"),
         shell=True,
@@ -173,6 +193,7 @@ def run_bash(args: JSONObject) -> str:
     return "".join(output).strip() or "(empty)"
 
 
+# API-friendly formatting of a tool dict
 TOOLS: dict[str, ToolSpec] = {
     "read": (
         "Read file with line numbers (file path, not directory)",
@@ -200,10 +221,16 @@ TOOLS: dict[str, ToolSpec] = {
         {"cmd": "string"},
         run_bash,
     ),
+    "returnToUser": (
+        "Return control to the user if no other tool calls are needed",
+        {},
+        return_to_user,
+    ),
 }
 
 
 def run_tool(name: str, args: JSONObject) -> str:
+    """Execute a tool"""
     try:
         return TOOLS[name][2](args)
     except KeyError:
@@ -213,6 +240,7 @@ def run_tool(name: str, args: JSONObject) -> str:
 
 
 def make_studio_tools() -> list[dict[str, object]]:
+    """Convert the tools list into actual API format"""
     tools: list[dict[str, object]] = []
     for name, (description, params, _fn) in TOOLS.items():
         properties = {
@@ -242,6 +270,7 @@ def make_studio_tools() -> list[dict[str, object]]:
 
 
 def get_tool_path(name: str, args: JSONObject) -> Path | None:
+    """Resolve the tool path"""
     if name not in {"read", "write", "edit", "glob", "grep"}:
         return None
     path = args.get("path")
@@ -249,6 +278,7 @@ def get_tool_path(name: str, args: JSONObject) -> Path | None:
 
 
 def make_tool_signature(name: str, args: JSONObject) -> str:
+    """Fill in the arguments for a tool"""
     normalized_args = dict(args)
     path = get_tool_path(name, args)
     if path is not None:
@@ -260,6 +290,7 @@ def make_tool_signature(name: str, args: JSONObject) -> str:
 
 
 def normalize_read_output(result: str) -> str:
+    """Normalizes the read tool output"""
     lines: list[str] = []
     for line in result.splitlines():
         match = re.match(r"^\s*\d+\| ?", line)
@@ -268,6 +299,7 @@ def normalize_read_output(result: str) -> str:
 
 
 def user_requested_direct_write(user_input: str, path: Path) -> bool:
+    """Checks if a user allows the model to write over existing files without reading"""
     request = user_input.lower()
     path_text = str(path).lower()
     explicit_phrases = (
@@ -284,7 +316,9 @@ def user_requested_direct_write(user_input: str, path: Path) -> bool:
     return (
         "write" in request.lower()
         and " to " in request.lower()
-        and (path.name.lower() in request.lower() or path_text.lower() in request.lower())
+        and (
+            path.name.lower() in request.lower() or path_text.lower() in request.lower()
+        )
     )
 
 
@@ -298,6 +332,7 @@ def enforce_tool_policy(
     repeated_calls: dict[str, int],
     max_identical_tool_calls: int = MAX_IDENTICAL_TOOL_CALLS,
 ) -> str | None:
+    """Check the model-generated tool call"""
     signature = make_tool_signature(tool_name, tool_args)
     if repeated_calls.get(signature, 0) >= max_identical_tool_calls:
         return (
@@ -365,6 +400,7 @@ def update_tool_state(
     last_reads: dict[str, ToolState],
     repeated_calls: dict[str, int],
 ) -> bool:
+    """Manages tool states for the policy"""
     signature = make_tool_signature(tool_name, tool_args)
     repeated_calls[signature] = repeated_calls.get(signature, 0) + 1
 
@@ -406,6 +442,7 @@ def update_tool_state(
 
 
 def convert_messages(system_prompt: str, messages: list[Message]) -> list[Message]:
+    """Manipulates messages to inject system prompt"""
     result: list[Message] = [{"role": "system", "content": system_prompt}]
     for message in messages:
         role, content = message["role"], message["content"]
@@ -464,6 +501,7 @@ def extract_message_text(content: object) -> str:
 
 
 def parse_tool_arguments(arguments: object) -> JSONObject:
+    """Parse the proposed tool call arguments"""
     if arguments in (None, ""):
         return {}
     arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
@@ -473,6 +511,7 @@ def parse_tool_arguments(arguments: object) -> JSONObject:
 
 
 def normalize_usage(payload: object) -> Usage:
+    """Normalizes the token usage"""
     usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
     usage = usage if isinstance(usage, dict) else {}
     input_tokens = get_optional_int(
@@ -491,6 +530,7 @@ def normalize_usage(payload: object) -> Usage:
 
 
 def extract_tool_calls(raw_calls: object) -> list[dict[str, object]]:
+    """Parse the list of agent-proposed tool calls"""
     calls: list[dict[str, object]] = []
     for i, tool_call in enumerate(raw_calls or []):
         if not isinstance(tool_call, dict):
@@ -512,6 +552,7 @@ def extract_tool_calls(raw_calls: object) -> list[dict[str, object]]:
 
 
 def extract_structured_response(text: object) -> tuple[str, list[dict[str, object]]]:
+    """Parse the agent's response"""
     if not isinstance(text, str):
         return "", []
     try:
@@ -550,6 +591,7 @@ def extract_structured_response(text: object) -> tuple[str, list[dict[str, objec
 
 
 def normalize_response(payload: object) -> Response:
+    """Normalize the agent's response"""
     payload = payload if isinstance(payload, dict) else {}
     choices = payload.get("choices", [])
     first = (
@@ -587,6 +629,7 @@ def normalize_response(payload: object) -> Response:
 def append_trace_row(
     task_id: str, condition: str, role: str, usage: Usage, stop_reason: str
 ) -> None:
+    """Output a log to the trace file"""
     TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
     TRACE_STATE["cumulative_total"] += usage["total_tokens"]
     TRACE_STATE["last_input_tokens"] = usage["input_tokens"]
@@ -620,6 +663,7 @@ def get_trace_state() -> dict[str, int]:
 
 
 def extract_text(content_blocks: list[dict[str, object]]) -> str:
+    """Pulls text from the parsed-normalized response data"""
     return "\n".join(
         block["text"]
         for block in content_blocks
@@ -639,6 +683,7 @@ def call_api(
     condition: str = DEFAULT_CONDITION,
     role: str = "single",
 ) -> Response:
+    """Invoke the GenStudio API"""
     if not STUDIO_API_KEY:
         raise RuntimeError("Missing STUDIO_API_KEY/API_KEY")
     if not STUDIO_API_URL:
@@ -684,11 +729,13 @@ def call_api(
 
 
 def separator() -> str:
+    """Terminal output separation line"""
     width = min(shutil.get_terminal_size(fallback=(80, 24)).columns, 80)
     return f"{DIM}{'─' * width}{RESET}"
 
 
 def status_line() -> str:
+    """Formatted status line for terminal output"""
     clock = datetime.now().strftime("%H:%M:%S")
     return (
         f"{DIM}[{clock}] API calls: {TRACE_STATE['call_count']} | "
@@ -723,21 +770,36 @@ SYSTEM_PROMPT: str = f"""
 You are a concise coding assistant with tool access.
 
 Operate with this protocol:
-1. If a tool result already answers the user's request, stop using tools and answer.
+1. If a previous tool result already answers the user's request, stop using tools and answer.
 2. Never repeat an identical tool call after a successful result.
 3. Prefer the minimum number of tool calls needed to complete the task.
 4. Read before editing existing files unless the user explicitly asked to overwrite them.
 5. Prefer read, glob, and grep over bash whenever they can accomplish the task.
+6. You must call return_to_user if no other tools are needed to fulfill the request.
+7. Never read a file you just wrote unless specifically asked to.
 
 cwd: {os.getcwd()}
 """
 
 
 def main() -> None:
+
+    aparser = argparse.ArgumentParser()
+    aparser.add_argument(
+        "--preview",
+        help="set the length of preview strings",
+        default=60,
+        type=int,
+    )
+    argspace = aparser.parse_args()
+    PREVIEW_LEN = argspace.preview
+
     print(
         f"{BOLD}nanoagent{RESET} | {DIM}{MODEL} (GenAI Studio) | {os.getcwd()}{RESET}\n"
     )
     messages: list[Message] = []
+
+    # This is the REPL loop for the nanoagent runtime
     while True:
         try:
             print(status_line())
@@ -758,6 +820,9 @@ def main() -> None:
             last_mutations: dict[str, ToolState] = {}
             last_reads: dict[str, ToolState] = {}
             repeated_calls: dict[str, int] = {}
+
+            # Get the model's response and iterate through tool calls
+            # This also sends tool output back to the model so it can propose additional calls
             while True:
                 response = call_api(
                     MODEL,
@@ -770,10 +835,15 @@ def main() -> None:
                     "single",
                 )
 
+                # Loop control handle
+                if response["tool_calls"][0]["name"] == "returnToUser":
+                    break
+
                 print(status_line())
                 tool_results: list[dict[str, str]] = []
-                halt_reason = None
+                halt_reason = ""
 
+                # Check each piece of the response for tool calls
                 for block in response["content"]:
                     if block["type"] == "text":
                         print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
@@ -816,7 +886,7 @@ def main() -> None:
                             repeated_calls,
                         )
                         lines = result.splitlines() or [result]
-                        preview = lines[0][:60]
+                        preview = lines[0][:PREVIEW_LEN]
                         if len(lines) > 1:
                             preview += f" ... +{len(lines) - 1} lines"
                         elif len(lines[0]) > 60:
@@ -830,20 +900,35 @@ def main() -> None:
                             }
                         )
 
-                messages.append({"role": "assistant", "content": response["content"]})
-                if tool_results:
-                    messages.append({"role": "user", "content": tool_results})
-                elif response["content"] and not tool_results:
-                    break
-                elif not response["content"]:
-                    break
-                if halt_reason:
+                # The API requires us to build up and re-send the whole conversation
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": response["tool_calls"],
+                        "content": response["content"],
+                    }
+                )
+
+                if len(tool_results) > 0 and response["stop_reason"] == "tool_calls":
+                    # Nifty trick to trim down "noise" in the message content
+                    tool_content_strings = []
+                    for tool_string in tool_results:
+                        tool_content_strings.append(
+                            f"A tool call created the following output: {tool_string['content']}"
+                        )
+                    messages.append(
+                        {"role": "user", "content": "\n".join(tool_content_strings)}
+                    )
+                elif halt_reason != "":
                     print(f"\n{CYAN}⏺{RESET} {halt_reason}.")
                     break
+                else:
+                    break
             print()
-        except (KeyboardInterrupt, EOFError):
+        except (KeyboardInterrupt, EOFError):  # Stop on Ctrl-C or Ctrl-D
             break
         except Exception as err:
+            traceback.print_exc()
             print(f"{RED}⏺ Error: {err}{RESET}")
 
 
