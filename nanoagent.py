@@ -279,12 +279,12 @@ def user_requested_direct_write(user_input: str, path: Path) -> bool:
         "new file",
         "from scratch",
     )
-    if any(phrase in request for phrase in explicit_phrases):
+    if any(phrase.lower() in request.lower() for phrase in explicit_phrases):
         return True
     return (
-        "write" in request
-        and " to " in request
-        and (path.name.lower() in request or path_text in request)
+        "write" in request.lower()
+        and " to " in request.lower()
+        and (path.name.lower() in request.lower() or path_text.lower() in request.lower())
     )
 
 
@@ -769,9 +769,11 @@ def main() -> None:
                     DEFAULT_CONDITION,
                     "single",
                 )
+
                 print(status_line())
                 tool_results: list[dict[str, str]] = []
                 halt_reason = None
+
                 for block in response["content"]:
                     if block["type"] == "text":
                         print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
@@ -827,10 +829,13 @@ def main() -> None:
                                 "content": result,
                             }
                         )
+
                 messages.append({"role": "assistant", "content": response["content"]})
                 if tool_results:
                     messages.append({"role": "user", "content": tool_results})
-                if not tool_results:
+                elif response["content"] and not tool_results:
+                    break
+                elif not response["content"]:
                     break
                 if halt_reason:
                     print(f"\n{CYAN}⏺{RESET} {halt_reason}.")
