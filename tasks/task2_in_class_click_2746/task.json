@@ -1,0 +1,13 @@
+{
+  "allowed_files": [],
+  "difficulty": "hard",
+  "issue_url": "https://github.com/pallets/click/issues/2746",
+  "known_fix_commit": "1787497713fa389435ed732c9b26274c3cdc458d",
+  "post_fix_commit": "0bfc8c7f35493d70d365d86e63f6658e43bfb2bf",
+  "post_fix_ref": "8.2.0",
+  "pre_fix_commit": "006ae84d651846c944331fff78e340701fe58562",
+  "pre_fix_ref": "8.1.7",
+  "repo_path": "repo",
+  "task_id": "click-2746",
+  "test_command": ""
+}
