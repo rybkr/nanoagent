@@ -782,20 +782,45 @@ cwd: {os.getcwd()}
 """
 
 
-def main() -> None:
+def run_task_workflow(
+    task_dir: str,
+    condition: str,
+    model: str | None,
+    log_path: str | None = None,
+) -> int:
+    """Run one packaged task in single-agent or orchestrated mode."""
+    from orchestrator import run_orchestrated
+    from run_single import run_single_agent
+    from task_support import load_task_bundle
 
-    aparser = argparse.ArgumentParser()
-    aparser.add_argument(
-        "--preview",
-        help="set the length of preview strings",
-        default=60,
-        type=int,
-    )
-    argspace = aparser.parse_args()
-    PREVIEW_LEN = argspace.preview
+    loaded = load_task_bundle(task_dir, model, condition)
+    if condition == "single":
+        result = run_single_agent(
+            issue_text=loaded["issue_text"],
+            repo_summary=loaded["repo_summary"],
+            config=loaded["config"],
+        )
+    else:
+        result = run_orchestrated(
+            issue_text=loaded["issue_text"],
+            repo_summary=loaded["repo_summary"],
+            config=loaded["config"],
+        )
+    output = json.dumps(result, indent=2)
+    if log_path:
+        path = Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(output + "\n")
+    print(output)
+    return 0
+
+
+def run_repl(preview_len: int, model: str | None) -> int:
+    """Run the interactive nanoagent REPL."""
+    selected_model = model or MODEL
 
     print(
-        f"{BOLD}nanoagent{RESET} | {DIM}{MODEL} (GenAI Studio) | {os.getcwd()}{RESET}\n"
+        f"{BOLD}nanoagent{RESET} | {DIM}{selected_model} (GenAI Studio) | {os.getcwd()}{RESET}\n"
     )
     messages: list[Message] = []
 
@@ -825,7 +850,7 @@ def main() -> None:
             # This also sends tool output back to the model so it can propose additional calls
             while True:
                 response = call_api(
-                    MODEL,
+                    selected_model,
                     8192,
                     SYSTEM_PROMPT,
                     messages,
@@ -899,7 +924,7 @@ def main() -> None:
                             repeated_calls,
                         )
                         lines = result.splitlines() or [result]
-                        preview = lines[0][:PREVIEW_LEN]
+                        preview = lines[0][:preview_len]
                         if len(lines) > 1:
                             preview += f" ... +{len(lines) - 1} lines"
                         elif len(lines[0]) > 60:
@@ -944,6 +969,52 @@ def main() -> None:
             traceback.print_exc()
             print(f"{RED}⏺ Error: {err}{RESET}")
 
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for either REPL or packaged-task execution."""
+    parser = argparse.ArgumentParser(
+        description="Run the nanoagent REPL or execute a packaged lab workflow."
+    )
+    parser.add_argument(
+        "--preview",
+        help="set the length of preview strings",
+        default=60,
+        type=int,
+    )
+    parser.add_argument("--task", help="Task directory")
+    parser.add_argument(
+        "--condition",
+        choices=("single", "orchestrated"),
+        default="single",
+        help="Which workflow to run for a packaged task",
+    )
+    parser.add_argument(
+        "--model",
+        default=MODEL,
+        help="Model name to send to the backend",
+    )
+    parser.add_argument(
+        "--log",
+        help="Optional output file for the packaged task JSON result",
+    )
+    args = parser.parse_args()
+
+    if args.condition and not args.task:
+        parser.error("--task is required when --condition is provided")
+    if args.log and not args.task:
+        parser.error("--log is only supported when --task is provided")
+
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    if args.task:
+        return run_task_workflow(args.task, args.condition, args.model, args.log)
+    return run_repl(args.preview, args.model)
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

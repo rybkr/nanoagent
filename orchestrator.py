@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""orchestrator - minimal multi-agent orchestrator for nanoagent"""
 
 import argparse
 import json
