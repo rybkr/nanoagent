@@ -1,0 +1,8 @@
+Task,Condition,Accepted,TotalTokens,FilesEdited,ToolCalls,Notes
+Simple,Single-agent,,,,,
+Simple,Orchestrated,,,,,
+Medium,Single-agent,,,,,
+Medium,Orchestrated,,,,,
+Hard,Single-agent,,,,,
+Hard,Orchestrated,,,,,
+

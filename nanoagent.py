@@ -9,10 +9,15 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.error
 import urllib.request
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv() -> None:
+        return None
 
 load_dotenv()
 
@@ -26,10 +31,20 @@ type Response = dict[str, object]
 type Usage = dict[str, int]
 type ToolState = dict[str, object]
 
-API_URL = os.environ.get("API_URL")
-API_KEY = os.environ.get("API_KEY")
-MODEL = os.environ.get("MODEL")
-TOOL_MODE = os.environ.get("TOOL_MODE", "native").strip().lower()
+STUDIO_API_URL = os.environ.get(
+    "STUDIO_API_URL",
+    os.environ.get("API_URL", "https://genai.rcac.purdue.edu/api/chat/completions"),
+)
+STUDIO_API_KEY = os.environ.get("STUDIO_API_KEY", os.environ.get("API_KEY"))
+MODEL = os.environ.get("STUDIO_MODEL", os.environ.get("MODEL"))
+TOOL_MODE = os.environ.get(
+    "STUDIO_TOOL_MODE",
+    os.environ.get("TOOL_MODE", "native"),
+).strip().lower()
+try:
+    STUDIO_TIMEOUT_SECONDS = int(os.environ.get("STUDIO_TIMEOUT_SECONDS", "60"))
+except ValueError:
+    STUDIO_TIMEOUT_SECONDS = 60
 
 TRACE_PATH = Path(os.environ.get("TRACE_PATH", "results/traces.jsonl"))
 DEFAULT_TASK_ID = os.environ.get("TASK_ID", "interactive")
@@ -281,9 +296,10 @@ def enforce_tool_policy(
     last_mutations: dict[str, ToolState],
     last_reads: dict[str, ToolState],
     repeated_calls: dict[str, int],
+    max_identical_tool_calls: int = MAX_IDENTICAL_TOOL_CALLS,
 ) -> str | None:
     signature = make_tool_signature(tool_name, tool_args)
-    if repeated_calls.get(signature, 0) >= MAX_IDENTICAL_TOOL_CALLS:
+    if repeated_calls.get(signature, 0) >= max_identical_tool_calls:
         return (
             f"error: repeated identical {tool_name} blocked; use the existing result "
             "or choose a different action"
@@ -433,6 +449,20 @@ def convert_messages(system_prompt: str, messages: list[Message]) -> list[Messag
     return result
 
 
+def extract_message_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return "\n".join(parts).strip()
+
+
 def parse_tool_arguments(arguments: object) -> JSONObject:
     if arguments in (None, ""):
         return {}
@@ -455,7 +485,7 @@ def normalize_usage(payload: object) -> Usage:
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": get_optional_int(
-            usage.get("total_tokens"), input_tokens + output_tokens
+            usage.get("total_tokens", usage.get("total")), input_tokens + output_tokens
         ),
     }
 
@@ -528,9 +558,9 @@ def normalize_response(payload: object) -> Response:
         else {}
     )
     message = first.get("message", {}) if isinstance(first.get("message"), dict) else {}
-    text = message.get("content", "")
+    text = extract_message_text(message.get("content", ""))
     tool_calls = extract_tool_calls(message.get("tool_calls"))
-    assistant_text = text if tool_calls and isinstance(text, str) else ""
+    assistant_text = text if tool_calls else ""
     if not tool_calls:
         assistant_text, tool_calls = extract_structured_response(text)
     stop_reason = first.get("finish_reason") or payload.get("stop_reason") or "stop"
@@ -577,6 +607,18 @@ def append_trace_row(
         handle.write(json.dumps(row) + "\n")
 
 
+def reset_trace_state() -> None:
+    TRACE_STATE["cumulative_total"] = 0
+    TRACE_STATE["last_input_tokens"] = 0
+    TRACE_STATE["last_output_tokens"] = 0
+    TRACE_STATE["last_total_tokens"] = 0
+    TRACE_STATE["call_count"] = 0
+
+
+def get_trace_state() -> dict[str, int]:
+    return dict(TRACE_STATE)
+
+
 def extract_text(content_blocks: list[dict[str, object]]) -> str:
     return "\n".join(
         block["text"]
@@ -597,8 +639,10 @@ def call_api(
     condition: str = DEFAULT_CONDITION,
     role: str = "single",
 ) -> Response:
-    if not API_KEY:
-        raise RuntimeError("Missing API_KEY")
+    if not STUDIO_API_KEY:
+        raise RuntimeError("Missing STUDIO_API_KEY/API_KEY")
+    if not STUDIO_API_URL:
+        raise RuntimeError("Missing STUDIO_API_URL/API_URL")
     use_native_tools = bool(tools) and TOOL_MODE == "native"
     extra_instruction = ""
     if tools and not use_native_tools:
@@ -610,7 +654,7 @@ def call_api(
             "normal assistant text."
         )
     request = urllib.request.Request(
-        API_URL,
+        STUDIO_API_URL,
         data=json.dumps(
             {
                 "model": model,
@@ -624,11 +668,15 @@ def call_api(
         ).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_KEY}",
+            "Authorization": f"Bearer {STUDIO_API_KEY}",
         },
     )
-    with urllib.request.urlopen(request) as response:
-        normalized = normalize_response(json.loads(response.read()))
+    try:
+        with urllib.request.urlopen(request, timeout=STUDIO_TIMEOUT_SECONDS) as response:
+            normalized = normalize_response(json.loads(response.read()))
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Studio request failed with HTTP {err.code}: {detail}") from err
     append_trace_row(
         task_id, condition, role, normalized["usage"], normalized["stop_reason"]
     )

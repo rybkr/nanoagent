@@ -1,4 +1,8 @@
 {
+  "allowed_files": [
+    "src/click/core.py",
+    "tests/test_options.py"
+  ],
   "extra_urls": [
     "https://github.com/pallets/click/pull/2724",
     "https://github.com/pallets/click/releases"
@@ -10,5 +14,7 @@
   "post_fix_ref": "8.1.8",
   "pre_fix_commit": "006ae84d651846c944331fff78e340701fe58562",
   "pre_fix_ref": "8.1.7",
+  "reproduction_command": "python3 -m pytest -q tests/test_options.py -k default",
+  "test_command": "python3 -m pytest -q tests/test_options.py",
   "title": "Empty string default values are not displayed"
 }

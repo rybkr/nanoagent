@@ -1,0 +1,20 @@
+{
+  "allowed_files": [
+    "src/click/core.py",
+    "tests/test_options.py"
+  ],
+  "extra_urls": [
+    "https://github.com/pallets/click/pull/3152",
+    "https://github.com/pallets/click/releases"
+  ],
+  "issue_number": 3084,
+  "issue_url": "https://github.com/pallets/click/issues/3084",
+  "known_fix_commit": "91de59c6c8abc8251e7af551cd4546cc964288af",
+  "post_fix_commit": "c421c63eb794d98f8b546bd84627f36a5a373970",
+  "post_fix_ref": "8.3.2",
+  "pre_fix_commit": "f80cf4b09fbe36099b7bfc065fbde30d053da46d",
+  "pre_fix_ref": "8.3.1",
+  "reproduction_command": "sh ../run_tests.sh",
+  "test_command": "sh ../run_tests.sh",
+  "title": "Optional value not optional anymore"
+}

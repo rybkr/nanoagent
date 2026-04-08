@@ -1,0 +1,20 @@
+{
+  "allowed_files": [
+    "src/click/termui.py",
+    "tests/test_utils.py"
+  ],
+  "extra_urls": [
+    "https://github.com/pallets/click/pull/3021",
+    "https://github.com/pallets/click/releases"
+  ],
+  "issue_number": 3019,
+  "issue_url": "https://github.com/pallets/click/issues/3019",
+  "known_fix_commit": "812b8000f79c1fbb747a2de5114fc74515558857",
+  "post_fix_commit": "f80cf4b09fbe36099b7bfc065fbde30d053da46d",
+  "post_fix_ref": "8.3.1",
+  "pre_fix_commit": "d44436997f26cb2890ff3c094352540473c69777",
+  "pre_fix_ref": "8.2.1",
+  "reproduction_command": "sh ../run_tests.sh",
+  "test_command": "sh ../run_tests.sh",
+  "title": "click.prompt and click.confirm prompt_suffix no longer works when suffix is empty"
+}
