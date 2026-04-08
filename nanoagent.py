@@ -834,9 +834,22 @@ def main() -> None:
                     DEFAULT_CONDITION,
                     "single",
                 )
+                response_tool_calls = (
+                    response["tool_calls"] if isinstance(response.get("tool_calls"), list) else []
+                )
+                response_content = (
+                    response["content"] if isinstance(response.get("content"), list) else []
+                )
 
                 # Loop control handle
-                if response["tool_calls"][0]["name"] == "returnToUser":
+                if (
+                    response_tool_calls
+                    and isinstance(response_tool_calls[0], dict)
+                    and response_tool_calls[0].get("name") == "returnToUser"
+                ):
+                    for block in response_content:
+                        if block.get("type") == "text" and isinstance(block.get("text"), str):
+                            print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
                     break
 
                 print(status_line())
@@ -844,7 +857,7 @@ def main() -> None:
                 halt_reason = ""
 
                 # Check each piece of the response for tool calls
-                for block in response["content"]:
+                for block in response_content:
                     if block["type"] == "text":
                         print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
                     elif block["type"] == "tool_use":
@@ -904,8 +917,8 @@ def main() -> None:
                 messages.append(
                     {
                         "role": "assistant",
-                        "tool_calls": response["tool_calls"],
-                        "content": response["content"],
+                        "tool_calls": response_tool_calls,
+                        "content": response_content,
                     }
                 )
 
