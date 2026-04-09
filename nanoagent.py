@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import urllib.error
 import traceback
 import argparse
@@ -16,14 +17,21 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
+if __name__ == "__main__":
+    sys.modules.setdefault("nanoagent", sys.modules[__name__])
+
 try:
     from dotenv import load_dotenv
 except ModuleNotFoundError:
-    def load_dotenv() -> None:
+    def load_dotenv(*_args: object, **_kwargs: object) -> None:
         return None
 
-# This will load in the environment from .env to be used by module constants
-load_dotenv()
+# Load environment variables from the repo-root .env if present.
+ENV_PATH = Path(__file__).resolve().with_name(".env")
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+else:
+    load_dotenv()
 
 # Type definitions
 type JSONValue = (
@@ -37,24 +45,31 @@ type Usage = dict[str, int]
 type ToolState = dict[str, object]
 
 # Constants
-STUDIO_API_URL = os.environ.get(
-    "STUDIO_API_URL",
-    os.environ.get("API_URL", "https://genai.rcac.purdue.edu/api/chat/completions"),
-)
-STUDIO_API_KEY = os.environ.get("STUDIO_API_KEY", os.environ.get("API_KEY"))
-MODEL = os.environ.get("STUDIO_MODEL", os.environ.get("MODEL"))
-TOOL_MODE = os.environ.get(
-    "STUDIO_TOOL_MODE",
-    os.environ.get("TOOL_MODE", "native"),
-).strip().lower()
+API_URL = os.environ.get("API_URL")
+API_KEY = os.environ.get("API_KEY")
+MODEL = os.environ.get("MODEL")
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def resolve_log_path(path_value: str, base_dir: str | Path | None = None) -> Path:
+    """Resolve relative log paths against a caller-provided base directory."""
+    candidate = Path(path_value).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    anchor = Path(base_dir).expanduser() if base_dir is not None else Path.cwd()
+    return anchor.resolve(strict=False) / candidate
+
+
+LOG_DIR = resolve_log_path(os.environ.get("LOG_DIR", "results"), PROJECT_ROOT)
+TOOL_MODE = os.environ.get("TOOL_MODE", "native").strip().lower()
 try:
     STUDIO_TIMEOUT_SECONDS = int(os.environ.get("STUDIO_TIMEOUT_SECONDS", "60"))
 except ValueError:
     STUDIO_TIMEOUT_SECONDS = 60
 
-TRACE_PATH = Path(os.environ.get("TRACE_PATH", "results/traces.jsonl"))
+TRACE_PATH = LOG_DIR / "traces.jsonl"
 DEFAULT_TASK_ID = os.environ.get("TASK_ID", "interactive")
-DEFAULT_CONDITION = os.environ.get("CONDITION", "single")
+DEFAULT_BUDGET = 50000
 TRACE_STATE: dict[str, int] = {
     "cumulative_total": 0,
     "last_input_tokens": 0,
@@ -68,6 +83,17 @@ MAX_IDENTICAL_TOOL_CALLS = 2
 ## Terminal formatting
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
 BLUE, CYAN, GREEN, RED = "\033[34m", "\033[36m", "\033[32m", "\033[31m"
+
+
+def set_trace_path(log_path: str | None, base_dir: str | Path | None = None) -> None:
+    """Override the trace output path when requested on the CLI."""
+    global TRACE_PATH, LOG_DIR
+    if not log_path:
+        return
+    TRACE_PATH = resolve_log_path(log_path, base_dir)
+    LOG_DIR = TRACE_PATH.parent
+    TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TRACE_PATH.touch(exist_ok=True)
 
 
 def get_required_str(args: JSONObject, key: str) -> str:
@@ -680,14 +706,14 @@ def call_api(
     messages: list[Message],
     tools: list[dict[str, object]],
     task_id: str = DEFAULT_TASK_ID,
-    condition: str = DEFAULT_CONDITION,
+    condition: str = "single",
     role: str = "single",
 ) -> Response:
     """Invoke the GenStudio API"""
-    if not STUDIO_API_KEY:
-        raise RuntimeError("Missing STUDIO_API_KEY/API_KEY")
-    if not STUDIO_API_URL:
-        raise RuntimeError("Missing STUDIO_API_URL/API_URL")
+    if not API_KEY:
+        raise RuntimeError("Missing API_KEY")
+    if not API_URL:
+        raise RuntimeError("Missing API_URL")
     use_native_tools = bool(tools) and TOOL_MODE == "native"
     extra_instruction = ""
     if tools and not use_native_tools:
@@ -699,7 +725,7 @@ def call_api(
             "normal assistant text."
         )
     request = urllib.request.Request(
-        STUDIO_API_URL,
+        API_URL,
         data=json.dumps(
             {
                 "model": model,
@@ -713,7 +739,7 @@ def call_api(
         ).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {STUDIO_API_KEY}",
+            "Authorization": f"Bearer {API_KEY}",
         },
     )
     try:
@@ -786,7 +812,7 @@ def run_task_workflow(
     task_dir: str,
     condition: str,
     model: str | None,
-    log_path: str | None = None,
+    budget: int,
 ) -> int:
     """Run one packaged task in single-agent or orchestrated mode."""
     from orchestrator import run_orchestrated
@@ -794,6 +820,7 @@ def run_task_workflow(
     from task_support import load_task_bundle
 
     loaded = load_task_bundle(task_dir, model, condition)
+    loaded["config"].max_total_tokens = budget
     if condition == "single":
         result = run_single_agent(
             issue_text=loaded["issue_text"],
@@ -807,17 +834,15 @@ def run_task_workflow(
             config=loaded["config"],
         )
     output = json.dumps(result, indent=2)
-    if log_path:
-        path = Path(log_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(output + "\n")
     print(output)
     return 0
 
 
-def run_repl(preview_len: int, model: str | None) -> int:
+def run_repl(model: str | None, budget: int) -> int:
     """Run the interactive nanoagent REPL."""
     selected_model = model or MODEL
+    preview_len = 60
+    reset_trace_state()
 
     print(
         f"{BOLD}nanoagent{RESET} | {DIM}{selected_model} (GenAI Studio) | {os.getcwd()}{RESET}\n"
@@ -837,6 +862,7 @@ def run_repl(preview_len: int, model: str | None) -> int:
                 break
             if user_input == "/c":
                 messages.clear()
+                reset_trace_state()
                 print(f"{GREEN}⏺ Cleared conversation{RESET}")
                 continue
             messages.append({"role": "user", "content": user_input})
@@ -849,6 +875,9 @@ def run_repl(preview_len: int, model: str | None) -> int:
             # Get the model's response and iterate through tool calls
             # This also sends tool output back to the model so it can propose additional calls
             while True:
+                if get_trace_state()["cumulative_total"] >= budget:
+                    print(f"\n{CYAN}⏺{RESET} Token budget exhausted ({budget} total tokens).")
+                    return 0
                 response = call_api(
                     selected_model,
                     8192,
@@ -856,7 +885,7 @@ def run_repl(preview_len: int, model: str | None) -> int:
                     messages,
                     make_studio_tools(),
                     DEFAULT_TASK_ID,
-                    DEFAULT_CONDITION,
+                    "single",
                     "single",
                 )
                 response_tool_calls = (
@@ -975,45 +1004,39 @@ def run_repl(preview_len: int, model: str | None) -> int:
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for either REPL or packaged-task execution."""
     parser = argparse.ArgumentParser(
-        description="Run the nanoagent REPL or execute a packaged lab workflow."
+        description="Run nanoagent interactively or execute a packaged task workflow."
     )
-    parser.add_argument(
-        "--preview",
-        help="set the length of preview strings",
-        default=60,
-        type=int,
-    )
-    parser.add_argument("--task", help="Task directory")
+    parser.add_argument("--task", help="Path to the task directory")
     parser.add_argument(
         "--condition",
         choices=("single", "orchestrated"),
         default="single",
-        help="Which workflow to run for a packaged task",
+        help="Which workflow to run",
+    )
+    parser.add_argument(
+        "--budget",
+        default=DEFAULT_BUDGET,
+        type=int,
+        help="Maximum total token budget",
     )
     parser.add_argument(
         "--model",
-        default=MODEL,
-        help="Model name to send to the backend",
+        help="Override the default model name from MODEL",
     )
     parser.add_argument(
         "--log",
-        help="Optional output file for the packaged task JSON result",
+        help="Path to the output trace log file (default: results/traces.jsonl)",
     )
-    args = parser.parse_args()
-
-    if args.condition and not args.task:
-        parser.error("--task is required when --condition is provided")
-    if args.log and not args.task:
-        parser.error("--log is only supported when --task is provided")
-
-    return args
+    return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    task_base_dir = Path(args.task).expanduser() if args.task else None
+    set_trace_path(args.log, task_base_dir)
     if args.task:
-        return run_task_workflow(args.task, args.condition, args.model, args.log)
-    return run_repl(args.preview, args.model)
+        return run_task_workflow(args.task, args.condition, args.model, args.budget)
+    return run_repl(args.model, args.budget)
 
 
 if __name__ == "__main__":
