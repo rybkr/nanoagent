@@ -41,9 +41,9 @@ class TaskConfig:
     model: str = MODEL
     max_tokens: int = 4096
     max_planner_passes: int = 3
-    max_implementer_passes: int = 2
-    max_implementer_steps: int = 6
-    max_reviewer_passes: int = 1
+    max_implementer_passes: int = 3
+    max_implementer_steps: int = 9
+    max_reviewer_passes: int = 2
     max_identical_tool_calls: int = 2
     file_budget: int = 3
     context_observation_limit: int = 8
@@ -57,17 +57,32 @@ class TaskConfig:
     phase: str = "in_class"
     setup_command: str = ""
     acceptance_description: str = ""
-    max_total_tokens: int = 40000
+    max_total_tokens: int = 75000
     max_single_agent_turns: int = 8
     max_tool_iterations: int = 12
 
 
+def normalize_task_dir(task_dir: str) -> tuple[str, str]:
+    """Accept either the task bundle root or its repo/ directory."""
+    resolved = os.path.abspath(task_dir)
+    if os.path.basename(resolved) == "repo":
+        bundle_dir = os.path.dirname(resolved)
+        repo_dir = resolved
+    else:
+        bundle_dir = resolved
+        repo_dir = os.path.join(resolved, "repo")
+    return bundle_dir, repo_dir
+
+
 def resolve_task_paths(task_dir: str) -> dict[str, str]:
+    bundle_dir, repo_dir = normalize_task_dir(task_dir)
     return {
-        "issue": os.path.join(task_dir, "ISSUE.md"),
-        "repo_summary": os.path.join(task_dir, "REPO_SUMMARY.md"),
-        "metadata": os.path.join(task_dir, "task.json"),
-        "run_tests": os.path.join(task_dir, "run_tests.sh"),
+        "bundle_dir": bundle_dir,
+        "repo_dir": repo_dir,
+        "issue": os.path.join(repo_dir, "ISSUE.md"),
+        "repo_summary": os.path.join(bundle_dir, "REPO_SUMMARY.md"),
+        "metadata": os.path.join(bundle_dir, "task.json"),
+        "run_tests": os.path.join(repo_dir, "run_tests.sh"),
     }
 
 
@@ -131,6 +146,8 @@ def normalize_task_tool_args(
         if tool_name in {"read", "write", "edit"}:
             normalized["path"] = resolve_repo_path(repo_path, normalized.get("path"))
         elif tool_name in {"glob", "grep"}:
+            if normalized.get("path") in (None, ""):
+                normalized["path"] = "."
             normalized["path"] = resolve_repo_path(
                 repo_path,
                 normalized.get("path"),
@@ -155,12 +172,13 @@ def normalize_task_tool_args(
 def load_task_bundle(task_dir: str, model: str | None, condition: str) -> dict[str, object]:
     paths = resolve_task_paths(task_dir)
     metadata: dict[str, object] = {}
+    default_config = TaskConfig()
     if os.path.exists(paths["metadata"]):
         metadata = parse_json_object(read_text(paths["metadata"]), {})
 
-    repo_path = metadata.get("repo_path") or task_dir
+    repo_path = metadata.get("repo_path") or paths["repo_dir"]
     if not os.path.isabs(repo_path):
-        repo_path = os.path.normpath(os.path.join(task_dir, str(repo_path)))
+        repo_path = os.path.normpath(os.path.join(paths["bundle_dir"], str(repo_path)))
 
     test_command = str(metadata.get("test_command", "")).strip()
     if not test_command and os.path.exists(paths["run_tests"]):
@@ -168,27 +186,45 @@ def load_task_bundle(task_dir: str, model: str | None, condition: str) -> dict[s
 
     config = TaskConfig(
         model=model or MODEL,
-        max_tokens=int(metadata.get("max_tokens", 4096)),
-        max_planner_passes=int(metadata.get("max_planner_passes", 3)),
-        max_implementer_passes=int(metadata.get("max_implementer_passes", 2)),
-        max_implementer_steps=int(metadata.get("max_implementer_steps", 6)),
-        max_reviewer_passes=int(metadata.get("max_reviewer_passes", 1)),
-        max_identical_tool_calls=int(metadata.get("max_identical_tool_calls", 2)),
-        file_budget=int(metadata.get("file_budget", 3)),
-        context_observation_limit=int(metadata.get("context_observation_limit", 8)),
-        max_diff_lines=int(metadata.get("max_diff_lines", 120)),
+        max_tokens=int(metadata.get("max_tokens", default_config.max_tokens)),
+        max_planner_passes=int(
+            metadata.get("max_planner_passes", default_config.max_planner_passes)
+        ),
+        max_implementer_passes=int(
+            metadata.get("max_implementer_passes", default_config.max_implementer_passes)
+        ),
+        max_implementer_steps=int(
+            metadata.get("max_implementer_steps", default_config.max_implementer_steps)
+        ),
+        max_reviewer_passes=int(
+            metadata.get("max_reviewer_passes", default_config.max_reviewer_passes)
+        ),
+        max_identical_tool_calls=int(
+            metadata.get("max_identical_tool_calls", default_config.max_identical_tool_calls)
+        ),
+        file_budget=int(metadata.get("file_budget", default_config.file_budget)),
+        context_observation_limit=int(
+            metadata.get("context_observation_limit", default_config.context_observation_limit)
+        ),
+        max_diff_lines=int(metadata.get("max_diff_lines", default_config.max_diff_lines)),
         condition=condition,
-        task_id=str(metadata.get("task_id", os.path.basename(os.path.abspath(task_dir)))),
+        task_id=str(metadata.get("task_id", os.path.basename(paths["bundle_dir"]))),
         test_command=test_command,
         reproduction_command=str(metadata.get("reproduction_command", "")).strip(),
         repo_path=repo_path,
         allowed_files=ensure_str_list(metadata.get("allowed_files", [])),
-        phase=str(metadata.get("phase", "in_class")).strip() or "in_class",
-        setup_command=str(metadata.get("setup_command", "")).strip(),
-        acceptance_description=str(metadata.get("acceptance_description", "")).strip(),
-        max_total_tokens=int(metadata.get("max_total_tokens", 40000)),
-        max_single_agent_turns=int(metadata.get("max_single_agent_turns", 8)),
-        max_tool_iterations=int(metadata.get("max_tool_iterations", 12)),
+        phase=str(metadata.get("phase", default_config.phase)).strip() or default_config.phase,
+        setup_command=str(metadata.get("setup_command", default_config.setup_command)).strip(),
+        acceptance_description=str(
+            metadata.get("acceptance_description", default_config.acceptance_description)
+        ).strip(),
+        max_total_tokens=int(metadata.get("max_total_tokens", default_config.max_total_tokens)),
+        max_single_agent_turns=int(
+            metadata.get("max_single_agent_turns", default_config.max_single_agent_turns)
+        ),
+        max_tool_iterations=int(
+            metadata.get("max_tool_iterations", default_config.max_tool_iterations)
+        ),
     )
     issue_text = read_text(paths["issue"])
     repo_summary = (
