@@ -48,10 +48,10 @@ class TaskConfig:
     max_tokens: int = 4096
     max_planner_passes: int = 3
     max_implementer_passes: int = 3
-    max_implementer_steps: int = 9
+    max_implementer_steps: int = 15
     max_reviewer_passes: int = 2
     max_identical_tool_calls: int = 2
-    file_budget: int = 3
+    file_budget: int = 12
     context_observation_limit: int = 8
     max_diff_lines: int = 120
     condition: str = "single"
@@ -65,7 +65,7 @@ class TaskConfig:
     acceptance_description: str = ""
     max_total_tokens: int = 75000
     max_single_agent_turns: int = 8
-    max_tool_iterations: int = 12
+    max_tool_iterations: int = 16
 
 
 def normalize_task_dir(task_dir: str) -> tuple[str, str]:

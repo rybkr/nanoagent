@@ -70,6 +70,7 @@ except ValueError:
     STUDIO_TIMEOUT_SECONDS = 60
 
 TRACE_PATH = LOG_DIR / "traces.jsonl"
+RAW_RESPONSE_LOG_PATH = LOG_DIR / "raw_responses.jsonl"
 DEFAULT_TASK_ID = os.environ.get("TASK_ID", "interactive")
 DEFAULT_BUDGET = 50000
 TRACE_STATE: dict[str, int] = {
@@ -89,11 +90,12 @@ BLUE, CYAN, GREEN, RED = "\033[34m", "\033[36m", "\033[32m", "\033[31m"
 
 def set_trace_path(log_path: str | None, base_dir: str | Path | None = None) -> None:
     """Override the trace output path when requested on the CLI."""
-    global TRACE_PATH, LOG_DIR
+    global TRACE_PATH, RAW_RESPONSE_LOG_PATH, LOG_DIR
     if not log_path:
         return
     TRACE_PATH = resolve_log_path(log_path, base_dir)
     LOG_DIR = TRACE_PATH.parent
+    RAW_RESPONSE_LOG_PATH = LOG_DIR / "raw_responses.jsonl"
     TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
     TRACE_PATH.touch(exist_ok=True)
 
@@ -580,14 +582,56 @@ def extract_message_text(content: object) -> str:
     return "\n".join(parts).strip()
 
 
-def parse_tool_arguments(arguments: object) -> JSONObject:
-    """Parse the proposed tool call arguments"""
+def format_json_error(err: json.JSONDecodeError, source: object) -> str:
+    """Summarize a JSON parsing failure with a short source preview."""
+    preview = source if isinstance(source, str) else repr(source)
+    preview = preview.replace("\n", "\\n")
+    if len(preview) > 160:
+        preview = preview[:157] + "..."
+    return f"{err.msg} at line {err.lineno} column {err.colno}; source={preview}"
+
+
+def append_raw_response_row(
+    *,
+    task_id: str,
+    condition: str,
+    role: str,
+    model: str,
+    stage: str,
+    raw_body: str,
+    details: object | None = None,
+) -> None:
+    """Write raw response bodies and parse diagnostics to a sidecar log."""
+    RAW_RESPONSE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "timestamp": datetime.now().isoformat(),
+        "task_id": task_id,
+        "condition": condition,
+        "role": role,
+        "model": model,
+        "stage": stage,
+        "raw_body": raw_body,
+    }
+    if details is not None:
+        row["details"] = details
+    with RAW_RESPONSE_LOG_PATH.open("a") as handle:
+        handle.write(json.dumps(row) + "\n")
+
+
+def parse_tool_arguments(
+    arguments: object,
+) -> tuple[JSONObject | None, str | None]:
+    """Parse the proposed tool call arguments."""
     if arguments in (None, ""):
-        return {}
-    arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+        return {}, None
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError as err:
+            return None, format_json_error(err, arguments)
     if not isinstance(arguments, dict):
-        raise ValueError("tool arguments must decode to an object")
-    return arguments
+        return None, "tool arguments must decode to an object"
+    return arguments, None
 
 
 def normalize_usage(payload: object) -> Usage:
@@ -609,9 +653,10 @@ def normalize_usage(payload: object) -> Usage:
     }
 
 
-def extract_tool_calls(raw_calls: object) -> list[dict[str, object]]:
-    """Parse the list of agent-proposed tool calls"""
+def extract_tool_calls(raw_calls: object) -> tuple[list[dict[str, object]], list[str]]:
+    """Parse the list of agent-proposed tool calls."""
     calls: list[dict[str, object]] = []
+    errors: list[str] = []
     for i, tool_call in enumerate(raw_calls or []):
         if not isinstance(tool_call, dict):
             continue
@@ -621,27 +666,37 @@ def extract_tool_calls(raw_calls: object) -> list[dict[str, object]]:
         name = function.get("name")
         if not isinstance(name, str):
             continue
+        arguments, error = parse_tool_arguments(function.get("arguments"))
+        if error is not None or arguments is None:
+            errors.append(
+                f"Skipped native tool call '{name}' at index {i}: "
+                f"{error or 'invalid arguments'}"
+            )
+            continue
         calls.append(
             {
                 "id": tool_call.get("id", f"call_{i}"),
                 "name": name,
-                "arguments": parse_tool_arguments(function.get("arguments")),
+                "arguments": arguments,
             }
         )
-    return calls
+    return calls, errors
 
 
-def extract_structured_response(text: object) -> tuple[str, list[dict[str, object]]]:
-    """Parse the agent's response"""
+def extract_structured_response(
+    text: object,
+) -> tuple[str, list[dict[str, object]], list[str]]:
+    """Parse the agent's response."""
     if not isinstance(text, str):
-        return "", []
+        return "", [], []
     try:
         payload = json.loads(text) if text else {}
     except json.JSONDecodeError:
-        return text, []
+        return text, [], []
     if not isinstance(payload, dict):
-        return text, []
+        return text, [], []
     tool_calls: list[dict[str, object]] = []
+    errors: list[str] = []
     for i, tool_call in enumerate(payload.get("tool_calls") or []):
         if not isinstance(tool_call, dict):
             continue
@@ -655,11 +710,18 @@ def extract_structured_response(text: object) -> tuple[str, list[dict[str, objec
             arguments = function.get("arguments", {})
         if not isinstance(name, str):
             continue
+        parsed_arguments, error = parse_tool_arguments(arguments)
+        if error is not None or parsed_arguments is None:
+            errors.append(
+                f"Skipped emulated tool call '{name}' at index {i}: "
+                f"{error or 'invalid arguments'}"
+            )
+            continue
         tool_calls.append(
             {
                 "id": tool_call.get("id", f"call_{i}"),
                 "name": name,
-                "arguments": parse_tool_arguments(arguments),
+                "arguments": parsed_arguments,
             }
         )
     assistant_text = payload.get("assistant_text")
@@ -667,7 +729,7 @@ def extract_structured_response(text: object) -> tuple[str, list[dict[str, objec
         assistant_text
         if isinstance(assistant_text, str)
         else ("" if tool_calls else text)
-    ), tool_calls
+    ), tool_calls, errors
 
 
 def normalize_response(payload: object) -> Response:
@@ -681,10 +743,15 @@ def normalize_response(payload: object) -> Response:
     )
     message = first.get("message", {}) if isinstance(first.get("message"), dict) else {}
     text = extract_message_text(message.get("content", ""))
-    tool_calls = extract_tool_calls(message.get("tool_calls"))
+    tool_calls, parse_errors = extract_tool_calls(message.get("tool_calls"))
     assistant_text = text if tool_calls else ""
     if not tool_calls:
-        assistant_text, tool_calls = extract_structured_response(text)
+        assistant_text, tool_calls, structured_errors = extract_structured_response(text)
+        parse_errors.extend(structured_errors)
+    if parse_errors and not assistant_text:
+        assistant_text = (
+            "The model returned malformed tool arguments, so this turn was skipped."
+        )
     stop_reason = first.get("finish_reason") or payload.get("stop_reason") or "stop"
     if tool_calls and stop_reason == "stop":
         stop_reason = "tool_calls"
@@ -703,6 +770,7 @@ def normalize_response(payload: object) -> Response:
         "usage": normalize_usage(payload),
         "stop_reason": stop_reason,
         "content": content,
+        "parse_errors": parse_errors,
     }
 
 
@@ -800,7 +868,34 @@ def call_api(
         with urllib.request.urlopen(
             request, timeout=STUDIO_TIMEOUT_SECONDS
         ) as response:
-            normalized = normalize_response(json.loads(response.read()))
+            raw_body = response.read().decode("utf-8", errors="replace")
+            try:
+                decoded = json.loads(raw_body)
+            except json.JSONDecodeError as err:
+                append_raw_response_row(
+                    task_id=task_id,
+                    condition=condition,
+                    role=role,
+                    model=model,
+                    stage="response_json_decode_error",
+                    raw_body=raw_body,
+                    details={"error": format_json_error(err, raw_body)},
+                )
+                raise RuntimeError(
+                    "Studio returned an invalid JSON response; see "
+                    f"{RAW_RESPONSE_LOG_PATH} for details"
+                ) from err
+            normalized = normalize_response(decoded)
+            if normalized["parse_errors"]:
+                append_raw_response_row(
+                    task_id=task_id,
+                    condition=condition,
+                    role=role,
+                    model=model,
+                    stage="tool_argument_parse_error",
+                    raw_body=raw_body,
+                    details={"parse_errors": normalized["parse_errors"]},
+                )
     except urllib.error.HTTPError as err:
         detail = err.read().decode("utf-8", errors="replace")
         raise RuntimeError(
