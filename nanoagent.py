@@ -136,6 +136,44 @@ def write(args: JSONObject) -> str:
     return f"Wrote '{content}' to {path}"
 
 
+def _find_relaxed_edit_match(text: str, old: str) -> tuple[str | None, int]:
+    """Find a unique multiline match while tolerating indentation differences."""
+    old_lines = old.splitlines()
+    if not old_lines:
+        return None, 0
+
+    text_lines = text.splitlines(keepends=True)
+    line_offsets: list[int] = []
+    offset = 0
+    for line in text_lines:
+        line_offsets.append(offset)
+        offset += len(line)
+
+    matches: list[str] = []
+    window_size = len(old_lines)
+    for start in range(len(text_lines) - window_size + 1):
+        window = text_lines[start : start + window_size]
+        if any(window[i].strip() != old_lines[i].strip() for i in range(window_size)):
+            continue
+        start_offset = line_offsets[start]
+        end_offset = line_offsets[start + window_size - 1] + len(
+            text_lines[start + window_size - 1].rstrip("\r\n")
+        )
+        matches.append(text[start_offset:end_offset])
+
+    unique_matches = list(dict.fromkeys(matches))
+    if len(unique_matches) == 1:
+        return unique_matches[0], 1
+    return None, len(unique_matches)
+
+
+def _compress_blank_lines(text: str) -> str:
+    """Remove empty lines from a snippet copied from numbered read output."""
+    lines = text.splitlines()
+    compact = [line for line in lines if line.strip()]
+    return "\n".join(compact)
+
+
 def edit(args: JSONObject) -> str:
     """Tool: Make edits to an existing file"""
     path = Path(get_required_str(args, "path"))
@@ -143,7 +181,21 @@ def edit(args: JSONObject) -> str:
     old = get_required_str(args, "old")
     count = text.count(old)
     if not count:
-        return "error: old_string not found"
+        relaxed_count = 0
+        for candidate_old in (old, _compress_blank_lines(old)):
+            relaxed_old, candidate_count = _find_relaxed_edit_match(text, candidate_old)
+            relaxed_count = max(relaxed_count, candidate_count)
+            if relaxed_old is not None:
+                old = relaxed_old
+                count = 1
+                break
+        if not count:
+            if relaxed_count > 1:
+                return (
+                    "error: old_string not found exactly and appears "
+                    f"{relaxed_count} times when ignoring indentation"
+                )
+            return "error: old_string not found"
     if not args.get("all") and count > 1:
         return f"error: old_string appears {count} times, must be unique (use all=true)"
     content: str = text.replace(

@@ -5,8 +5,16 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 
-from nanoagent import MODEL, call_api, get_trace_state, reset_trace_state, run_tool
+from nanoagent import (
+    MODEL,
+    call_api,
+    get_trace_state,
+    make_studio_tools,
+    reset_trace_state,
+    run_tool,
+)
 from task_support import (
     TaskConfig,
     evaluate_acceptance,
@@ -153,7 +161,127 @@ def default_review():
     }
 
 
-def planner_prompt(issue_text, repo_summary, config):
+def _ordered_unique(items):
+    seen = set()
+    ordered = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def extract_issue_identifiers(issue_text, repo_summary, limit=8):
+    text = f"{issue_text}\n{repo_summary}"
+    backtick_blocks = re.findall(r"`([^`]+)`", text)
+    file_paths = re.findall(r"\b(?:[\w.-]+/)+[\w.-]+\.py\b", text)
+    function_names = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text)
+    code_like_words = re.findall(
+        r"\b(?:[A-Za-z0-9]*_[A-Za-z0-9_]+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,}[A-Za-z0-9]*)\b",
+        text,
+    )
+
+    candidates = []
+    for path in file_paths:
+        candidates.append(path)
+        path_parts = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", path)
+        candidates.extend(path_parts)
+    for block in backtick_blocks:
+        candidates.extend(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", block))
+    candidates.extend(function_names)
+    candidates.extend(code_like_words)
+
+    return _ordered_unique(candidates)[:limit]
+
+
+def summarize_discovery_hits(hit_lines, repo_path, limit=20):
+    if not hit_lines:
+        return "(none)"
+    summarized = []
+    for line in hit_lines[:limit]:
+        path_text = line.split(":", 1)[0]
+        summarized.append(to_repo_relative(repo_path, path_text))
+    unique = list(dict.fromkeys(summarized))
+    return "\n".join(f"- {entry}" for entry in unique[:limit]) or "(none)"
+
+
+def run_discovery(issue_text, repo_summary, config):
+    identifiers = extract_issue_identifiers(issue_text, repo_summary)
+    root_listing = execute_tool_action(
+        "glob",
+        {"path": ".", "pat": "*"},
+        config.repo_path,
+        READ_ONLY_TOOLS,
+        {},
+        config.max_identical_tool_calls,
+    )
+    python_listing = execute_tool_action(
+        "glob",
+        {"path": ".", "pat": "**/*.py"},
+        config.repo_path,
+        READ_ONLY_TOOLS,
+        {},
+        config.max_identical_tool_calls,
+    )
+    grep_summaries = []
+    for identifier in identifiers[:4]:
+        grep_result = execute_tool_action(
+            "grep",
+            {"path": ".", "pat": identifier},
+            config.repo_path,
+            READ_ONLY_TOOLS,
+            {},
+            config.max_identical_tool_calls,
+        )
+        hit_lines = [
+            line
+            for line in str(grep_result["raw_result"]).splitlines()
+            if line.strip() and line.strip() != "none"
+        ]
+        grep_summaries.append(
+            {
+                "identifier": identifier,
+                "matches": summarize_discovery_hits(hit_lines, config.repo_path),
+            }
+        )
+
+    summary_lines = [
+        "Repository discovery:",
+        "Top-level entries:",
+        trim_text(root_listing["raw_result"], 1200),
+        "",
+        "Python files:",
+        trim_text(python_listing["raw_result"], 1800),
+        "",
+        "Identifier matches:",
+    ]
+    if grep_summaries:
+        for item in grep_summaries:
+            summary_lines.append(f"{item['identifier']}:")
+            summary_lines.append(item["matches"])
+    else:
+        summary_lines.append("(none)")
+
+    discovered_files = []
+    for item in grep_summaries:
+        for line in item["matches"].splitlines():
+            entry = line.removeprefix("- ").strip()
+            if (
+                entry
+                and entry not in discovered_files
+                and entry != "(none)"
+                and entry.endswith(".py")
+            ):
+                discovered_files.append(entry)
+    return {
+        "identifiers": identifiers,
+        "discovered_files": discovered_files[:12],
+        "summary": "\n".join(summary_lines).strip(),
+    }
+
+
+def planner_prompt(issue_text, repo_summary, discovery_summary, config):
     return (
         "You are the planner in a deterministic software engineering workflow.\n"
         "Return JSON only.\n"
@@ -170,6 +298,9 @@ def planner_prompt(issue_text, repo_summary, config):
         f"Acceptance: {config.acceptance_description or 'Provided tests must pass and constraints must hold.'}\n"
         f"Canonical test command: {config.test_command or '(none provided)'}\n"
         f"Reproduction command: {config.reproduction_command or '(none provided)'}\n"
+        "Use the repository discovery evidence below rather than guessing file names.\n"
+        "Prefer files that were actually discovered in the codebase.\n"
+        f"Discovery summary:\n{discovery_summary}\n\n"
         f"Issue:\n{issue_text}\n\n"
         f"Repo summary:\n{repo_summary}\n"
     )
@@ -190,10 +321,8 @@ def implementer_prompt(
     )
     return (
         "You are the implementer in a deterministic software engineering workflow.\n"
-        "Return JSON only.\n"
-        "Choose exactly one action:\n"
-        '{ "action": "tool", "reason": "short reason", "tool": "read|write|edit|glob|grep|bash", "args": {...} }\n'
-        "or\n"
+        "Use the provided tools directly for inspection and editing.\n"
+        "When the requested work is complete, return JSON only in this schema:\n"
         '{ "action": "done", "reason": "short reason", "summary": "short summary", '
         '"completed_checks": ["check 1"], "remaining_risks": ["risk 1"] }\n'
         "Rules:\n"
@@ -202,15 +331,17 @@ def implementer_prompt(
         "- Use bash only for read-only verification commands.\n"
         "- All file tools are confined to the staged repo checkout.\n"
         "- Do not change more than the allowed file budget.\n"
-        "- If the requested work is complete, choose action=done.\n\n"
+        "- Do not describe tool calls in JSON or prose; call the tool directly.\n"
+        "- If the requested work is complete, return the done JSON object.\n\n"
         "Allowed tool schemas:\n"
         '- read: {"path": "relative/or/absolute/path", "offset": 0, "limit": 120}\n'
-        '- glob: {"path": "directory", "pat": "*"}\n'
-        '- grep: {"path": "directory", "pat": "regex"}\n'
+        '- glob: {"path": ".", "pat": "*"}\n'
+        '- grep: {"path": ".", "pat": "regex"}\n'
         '- edit: {"path": "file", "old": "exact existing text", "new": "replacement text"}\n'
         '- write: {"path": "file", "content": "full file contents"}\n'
         '- bash: {"cmd": "python3 -m unittest -q"}\n'
         "Use the exact argument names shown above.\n"
+        'For glob or grep at repository root, set "path" to "." instead of an empty string.\n'
         "For edit, provide both old and new with exact text.\n"
         "If edit.old is not unique, read the file and use a larger unique old snippet including surrounding lines.\n"
         "Prefer simple repo-relative paths like calc.py or test_calc.py.\n"
@@ -225,6 +356,8 @@ def implementer_prompt(
         f"Reproduction command: {config.reproduction_command or '(none provided)'}\n"
         f"Current modified files: {modified_files or ['(none)']}\n"
         f"Critique to address: {critique or 'None.'}\n\n"
+        "Prioritize files named in suspected_relevant_files and reviewer feedback before "
+        "exploring unrelated files.\n\n"
         f"Plan:\n{compact_json(plan)}\n\n"
         f"Issue:\n{issue_text}\n\n"
         f"Repo summary:\n{repo_summary}\n\n"
@@ -269,6 +402,74 @@ def run_text_role(role, system_prompt, user_prompt, config):
 def run_json_role(role, system_prompt, user_prompt, config, fallback):
     raw_text = run_text_role(role, system_prompt, user_prompt, config)
     return parse_json_object(raw_text, fallback), raw_text
+
+
+def make_implementer_tools():
+    tools = []
+    for tool in make_studio_tools():
+        function = tool.get("function", {}) if isinstance(tool, dict) else {}
+        if function.get("name") == "returnToUser":
+            continue
+        tools.append(tool)
+    return tools
+
+
+def normalize_implementer_decision(decision):
+    if not isinstance(decision, dict):
+        return decision
+    action = str(decision.get("action", "")).strip()
+    if action in READ_ONLY_TOOLS | {"write", "edit", "bash"}:
+        tool_args = (
+            dict(decision.get("args", {}))
+            if isinstance(decision.get("args"), dict)
+            else {
+                key: value
+                for key, value in decision.items()
+                if key not in {"action", "reason", "tool", "args"}
+            }
+        )
+        return {
+            "action": "tool",
+            "tool": action,
+            "args": tool_args,
+            "reason": str(decision.get("reason", "")).strip(),
+        }
+    if action == "tool" and isinstance(decision.get("args"), dict):
+        tool_name = str(decision.get("tool", "")).strip()
+        tool_args = dict(decision.get("args", {}))
+        if not tool_name:
+            tool_name = str(
+                tool_args.get("tool") or tool_args.get("action") or tool_args.get("name") or ""
+            ).strip()
+        if isinstance(tool_args.get("args"), dict):
+            nested_args = dict(tool_args.get("args", {}))
+            if not tool_name:
+                tool_name = str(
+                    tool_args.get("tool")
+                    or tool_args.get("action")
+                    or tool_args.get("name")
+                    or ""
+                ).strip()
+            tool_args = nested_args
+        return {
+            "action": "tool",
+            "tool": tool_name,
+            "args": tool_args,
+            "reason": str(decision.get("reason", "")).strip(),
+        }
+    if action == "tool":
+        tool_name = str(decision.get("tool", "")).strip()
+        tool_args = {
+            key: value
+            for key, value in decision.items()
+            if key not in {"action", "reason", "tool", "args"}
+        }
+        return {
+            **decision,
+            "tool": tool_name,
+            "args": decision.get("args") if isinstance(decision.get("args"), dict) else tool_args,
+        }
+    return decision
 
 
 def execute_tool_action(
@@ -330,32 +531,129 @@ def run_implementer_pass(issue_text, repo_summary, plan, critique, config):
     observations = []
     signature_counts = {}
     last_raw = ""
+    active_critique = critique
+    messages = [
+        {
+            "role": "user",
+            "content": implementer_prompt(
+                issue_text,
+                repo_summary,
+                plan,
+                active_critique,
+                observations,
+                get_modified_files(config.repo_path),
+                config,
+                1,
+            ),
+        }
+    ]
+    tools = make_implementer_tools()
 
     for step in range(1, config.max_implementer_steps + 1):
         if not within_token_budget(config):
             break
-        decision, last_raw = run_json_role(
-            "implementer",
-            f"Concise coding assistant. cwd: {os.getcwd()}",
-            implementer_prompt(
-                issue_text,
-                repo_summary,
-                plan,
-                critique,
-                observations,
-                get_modified_files(config.repo_path),
-                config,
-                step,
+        response = call_api(
+            model=config.model,
+            max_tokens=config.max_tokens,
+            system=(
+                "You are a concise coding assistant. Use tools directly when needed. "
+                "When no more tool calls are needed, return exactly one JSON object "
+                "matching the requested done schema. Do not use markdown fences or "
+                f"explanatory prose. cwd: {os.getcwd()}"
             ),
-            config,
-            {
-                "action": "done",
-                "reason": "Implementer output was not valid JSON.",
-                "summary": "Implementer output was not valid JSON.",
-                "completed_checks": [],
-                "remaining_risks": ["Invalid implementer output"],
-            },
+            messages=messages,
+            tools=tools,
+            task_id=config.task_id,
+            condition=config.condition,
+            role="implementer",
         )
+        last_raw = response["assistant_text"] or extract_text(response.get("content", []))
+        messages.append({"role": "assistant", "content": response["content"]})
+
+        if response["tool_calls"]:
+            tool_results = []
+            for i, tool_call in enumerate(response["tool_calls"]):
+                observation = execute_tool_action(
+                    tool_call["name"],
+                    tool_call["arguments"],
+                    config.repo_path,
+                    set(READ_ONLY_TOOLS) | {"write", "edit", "bash"},
+                    signature_counts,
+                    config.max_identical_tool_calls,
+                    config.allowed_files,
+                )
+                observation["reason"] = last_raw or f"tool_call_{i + 1}"
+                observations.append(observation)
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.get("id", f"call_{i}"),
+                        "content": observation["raw_result"],
+                    }
+                )
+                if observation["raw_result"].startswith("error:"):
+                    active_critique = (
+                        "Your previous tool request failed. "
+                        f"Error: {observation['raw_result']}. "
+                        "Choose a different valid action."
+                    )
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        decision = normalize_implementer_decision(
+            parse_json_object(
+                last_raw,
+                {
+                    "action": "done",
+                    "reason": "Implementer output was not valid JSON.",
+                    "summary": "Implementer output was not valid JSON.",
+                    "completed_checks": [],
+                    "remaining_risks": ["Invalid implementer output"],
+                },
+            )
+        )
+
+        if decision.get("reason") == "Implementer output was not valid JSON.":
+            observations.append(
+                {
+                    "tool": "none",
+                    "args": {},
+                    "reason": "Model failed to return valid JSON",
+                    "summary": "error: implementer output was not valid JSON",
+                    "raw_result": last_raw,
+                }
+            )
+            active_critique = (
+                "Your previous reply was not valid JSON. "
+                "Reply with exactly one JSON object using the documented schema."
+            )
+            messages.append({"role": "user", "content": active_critique})
+            continue
+
+        if decision.get("action") == "tool":
+            tool_name = str(decision.get("tool", "")).strip()
+            tool_args = decision.get("args", {})
+            observation = execute_tool_action(
+                tool_name,
+                tool_args,
+                config.repo_path,
+                set(READ_ONLY_TOOLS) | {"write", "edit", "bash"},
+                signature_counts,
+                config.max_identical_tool_calls,
+                config.allowed_files,
+            )
+            observation["reason"] = str(decision.get("reason", "")).strip()
+            observations.append(observation)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Your previous reply described a tool action in text instead of "
+                        f"calling the tool. The tool result was:\n{observation['raw_result']}"
+                    ),
+                }
+            )
+            continue
 
         if decision.get("action") == "done":
             return {
@@ -366,20 +664,15 @@ def run_implementer_pass(issue_text, repo_summary, plan, critique, config):
                 "raw_last": last_raw,
                 "modified_files": get_modified_files(config.repo_path),
             }
-
-        tool_name = str(decision.get("tool", "")).strip()
-        tool_args = decision.get("args", {})
-        observation = execute_tool_action(
-            tool_name,
-            tool_args,
-            config.repo_path,
-            set(READ_ONLY_TOOLS) | {"write", "edit", "bash"},
-            signature_counts,
-            config.max_identical_tool_calls,
-            config.allowed_files,
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Your previous reply did not request a tool and did not return the "
+                    "done JSON object. Use a tool or return the done JSON object."
+                ),
+            }
         )
-        observation["reason"] = str(decision.get("reason", "")).strip()
-        observations.append(observation)
 
     return {
         "summary": "Implementer exhausted the step budget.",
@@ -393,10 +686,11 @@ def run_implementer_pass(issue_text, repo_summary, plan, critique, config):
 
 def run_orchestrated(issue_text, repo_summary, config):
     reset_trace_state()
+    discovery = run_discovery(issue_text, repo_summary, config)
     plan = normalize_plan(
         {
             "goal": "",
-            "suspected_relevant_files": [],
+            "suspected_relevant_files": discovery["discovered_files"],
             "inspection_goals": [],
             "implementation_outline": [],
             "acceptance_checks": [],
@@ -411,13 +705,17 @@ def run_orchestrated(issue_text, repo_summary, config):
         planner_output, planner_raw = run_json_role(
             "planner",
             f"Concise coding assistant. cwd: {os.getcwd()}",
-            planner_prompt(issue_text, repo_summary, config),
+            planner_prompt(issue_text, repo_summary, discovery["summary"], config),
             config,
             plan,
         )
         parsed_plan = normalize_plan(planner_output)
         if parsed_plan:
             plan.update(parsed_plan)
+            merged_files = list(
+                dict.fromkeys(discovery["discovered_files"] + plan["suspected_relevant_files"])
+            )
+            plan["suspected_relevant_files"] = merged_files
             break
 
     critique = ""
@@ -479,7 +777,23 @@ def run_orchestrated(issue_text, repo_summary, config):
         review["risks"] = ensure_str_list(review.get("risks"))
         reviewer_runs.append(review)
 
-        critique = str(review.get("critique", "")).strip()
+        critique_parts = [str(review.get("critique", "")).strip()]
+        if review["follow_up_focus"]:
+            critique_parts.append(
+                "Reviewer follow-up focus: " + "; ".join(review["follow_up_focus"])
+            )
+            follow_up_discovery = run_discovery(
+                "\n".join(review["follow_up_focus"]),
+                repo_summary,
+                config,
+            )
+            merged_files = list(
+                dict.fromkeys(
+                    plan["suspected_relevant_files"] + follow_up_discovery["discovered_files"]
+                )
+            )
+            plan["suspected_relevant_files"] = merged_files
+        critique = "\n".join(part for part in critique_parts if part)
         if not critique:
             break
 
