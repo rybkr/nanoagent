@@ -3,7 +3,7 @@
 set -e
 
 REPO_URL="https://github.com/rybkr/textstats"
-BASE_BRANCH="task-hard"
+BASE_BRANCH="task-takehome-medium"
 TASK_DIR="repo"
 
 rm -rf "$TASK_DIR"

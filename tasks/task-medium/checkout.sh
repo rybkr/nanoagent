@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# checkout.sh — Task: psf__requests-1921 (simple)
-# Removes a default session header by setting it to None
 
 set -e
 
