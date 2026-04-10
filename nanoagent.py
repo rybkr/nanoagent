@@ -23,8 +23,10 @@ if __name__ == "__main__":
 try:
     from dotenv import load_dotenv
 except ModuleNotFoundError:
+
     def load_dotenv(*_args: object, **_kwargs: object) -> None:
         return None
+
 
 # Load environment variables from the repo-root .env if present.
 ENV_PATH = Path(__file__).resolve().with_name(".env")
@@ -795,11 +797,15 @@ def call_api(
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=STUDIO_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(
+            request, timeout=STUDIO_TIMEOUT_SECONDS
+        ) as response:
             normalized = normalize_response(json.loads(response.read()))
     except urllib.error.HTTPError as err:
         detail = err.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Studio request failed with HTTP {err.code}: {detail}") from err
+        raise RuntimeError(
+            f"Studio request failed with HTTP {err.code}: {detail}"
+        ) from err
     append_trace_row(
         task_id, condition, role, normalized["usage"], normalized["stop_reason"]
     )
@@ -928,7 +934,9 @@ def run_repl(model: str | None, budget: int) -> int:
             # This also sends tool output back to the model so it can propose additional calls
             while True:
                 if get_trace_state()["cumulative_total"] >= budget:
-                    print(f"\n{CYAN}⏺{RESET} Token budget exhausted ({budget} total tokens).")
+                    print(
+                        f"\n{CYAN}⏺{RESET} Token budget exhausted ({budget} total tokens)."
+                    )
                     return 0
                 response = call_api(
                     selected_model,
@@ -941,10 +949,14 @@ def run_repl(model: str | None, budget: int) -> int:
                     "single",
                 )
                 response_tool_calls = (
-                    response["tool_calls"] if isinstance(response.get("tool_calls"), list) else []
+                    response["tool_calls"]
+                    if isinstance(response.get("tool_calls"), list)
+                    else []
                 )
                 response_content = (
-                    response["content"] if isinstance(response.get("content"), list) else []
+                    response["content"]
+                    if isinstance(response.get("content"), list)
+                    else []
                 )
 
                 # Loop control handle
@@ -954,7 +966,9 @@ def run_repl(model: str | None, budget: int) -> int:
                     and response_tool_calls[0].get("name") == "returnToUser"
                 ):
                     for block in response_content:
-                        if block.get("type") == "text" and isinstance(block.get("text"), str):
+                        if block.get("type") == "text" and isinstance(
+                            block.get("text"), str
+                        ):
                             print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
                     break
 

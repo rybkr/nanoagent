@@ -17,6 +17,12 @@ def read_text(path: str) -> str:
         return handle.read()
 
 
+def truncate_text(text: str, limit: int = 1600) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 17] + "\n... (truncated)"
+
+
 def parse_json_object(text: object, fallback: dict[str, object]) -> dict[str, object]:
     if isinstance(text, dict):
         return text
@@ -102,7 +108,9 @@ def is_within_repo(repo_path: str, candidate: Path) -> bool:
     return resolved == root or root in resolved.parents
 
 
-def resolve_repo_path(repo_path: str, path_value: object, *, default: str | None = None) -> str:
+def resolve_repo_path(
+    repo_path: str, path_value: object, *, default: str | None = None
+) -> str:
     if path_value is None:
         if default is None:
             raise ValueError("missing path")
@@ -169,7 +177,9 @@ def normalize_task_tool_args(
     return normalized, None
 
 
-def load_task_bundle(task_dir: str, model: str | None, condition: str) -> dict[str, object]:
+def load_task_bundle(
+    task_dir: str, model: str | None, condition: str
+) -> dict[str, object]:
     paths = resolve_task_paths(task_dir)
     metadata: dict[str, object] = {}
     default_config = TaskConfig()
@@ -191,7 +201,9 @@ def load_task_bundle(task_dir: str, model: str | None, condition: str) -> dict[s
             metadata.get("max_planner_passes", default_config.max_planner_passes)
         ),
         max_implementer_passes=int(
-            metadata.get("max_implementer_passes", default_config.max_implementer_passes)
+            metadata.get(
+                "max_implementer_passes", default_config.max_implementer_passes
+            )
         ),
         max_implementer_steps=int(
             metadata.get("max_implementer_steps", default_config.max_implementer_steps)
@@ -200,27 +212,42 @@ def load_task_bundle(task_dir: str, model: str | None, condition: str) -> dict[s
             metadata.get("max_reviewer_passes", default_config.max_reviewer_passes)
         ),
         max_identical_tool_calls=int(
-            metadata.get("max_identical_tool_calls", default_config.max_identical_tool_calls)
+            metadata.get(
+                "max_identical_tool_calls", default_config.max_identical_tool_calls
+            )
         ),
         file_budget=int(metadata.get("file_budget", default_config.file_budget)),
         context_observation_limit=int(
-            metadata.get("context_observation_limit", default_config.context_observation_limit)
+            metadata.get(
+                "context_observation_limit", default_config.context_observation_limit
+            )
         ),
-        max_diff_lines=int(metadata.get("max_diff_lines", default_config.max_diff_lines)),
+        max_diff_lines=int(
+            metadata.get("max_diff_lines", default_config.max_diff_lines)
+        ),
         condition=condition,
         task_id=str(metadata.get("task_id", os.path.basename(paths["bundle_dir"]))),
         test_command=test_command,
         reproduction_command=str(metadata.get("reproduction_command", "")).strip(),
         repo_path=repo_path,
         allowed_files=ensure_str_list(metadata.get("allowed_files", [])),
-        phase=str(metadata.get("phase", default_config.phase)).strip() or default_config.phase,
-        setup_command=str(metadata.get("setup_command", default_config.setup_command)).strip(),
-        acceptance_description=str(
-            metadata.get("acceptance_description", default_config.acceptance_description)
+        phase=str(metadata.get("phase", default_config.phase)).strip()
+        or default_config.phase,
+        setup_command=str(
+            metadata.get("setup_command", default_config.setup_command)
         ).strip(),
-        max_total_tokens=int(metadata.get("max_total_tokens", default_config.max_total_tokens)),
+        acceptance_description=str(
+            metadata.get(
+                "acceptance_description", default_config.acceptance_description
+            )
+        ).strip(),
+        max_total_tokens=int(
+            metadata.get("max_total_tokens", default_config.max_total_tokens)
+        ),
         max_single_agent_turns=int(
-            metadata.get("max_single_agent_turns", default_config.max_single_agent_turns)
+            metadata.get(
+                "max_single_agent_turns", default_config.max_single_agent_turns
+            )
         ),
         max_tool_iterations=int(
             metadata.get("max_tool_iterations", default_config.max_tool_iterations)
@@ -228,7 +255,9 @@ def load_task_bundle(task_dir: str, model: str | None, condition: str) -> dict[s
     )
     issue_text = read_text(paths["issue"])
     repo_summary = (
-        read_text(paths["repo_summary"]) if os.path.exists(paths["repo_summary"]) else ""
+        read_text(paths["repo_summary"])
+        if os.path.exists(paths["repo_summary"])
+        else ""
     )
     return {
         "issue_path": paths["issue"],
@@ -296,7 +325,9 @@ def evaluate_acceptance(
     allowed_files = allowed_files or []
     modified_files = get_modified_files(repo_path)
     within_budget = file_budget is None or len(modified_files) <= file_budget
-    allowed_ok = not allowed_files or all(path in allowed_files for path in modified_files)
+    allowed_ok = not allowed_files or all(
+        path in allowed_files for path in modified_files
+    )
 
     tests_run = bool(test_command)
     tests_passed: bool | None = None

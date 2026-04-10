@@ -22,17 +22,14 @@ from task_support import (
     get_diff_summary,
     load_task_bundle,
     normalize_task_tool_args,
+    truncate_text,
 )
 
 
-def truncate(text: str, limit: int = 1600) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 17] + "\n... (truncated)"
-
-
 def build_task_prompt(issue_text, repo_summary, config):
-    allowed_files = ", ".join(config.allowed_files) if config.allowed_files else "(any files)"
+    allowed_files = (
+        ", ".join(config.allowed_files) if config.allowed_files else "(any files)"
+    )
     return (
         "Fix the bug described below in the current repository checkout.\n\n"
         f"Issue:\n{issue_text}\n\n"
@@ -58,14 +55,16 @@ def build_feedback(acceptance, reason):
         f"Tests passed: {acceptance['tests_passed']}\n"
         f"Constraints satisfied: {acceptance['constraints_satisfied']}\n"
         f"Modified files: {acceptance['modified_files']}\n"
-        f"Test output:\n{truncate(str(acceptance['test_output']))}\n"
+        f"Test output:\n{truncate_text(str(acceptance['test_output']))}\n"
         "Continue only if a concrete next change is needed."
     )
 
 
 def run_single_agent(issue_text, repo_summary, config):
     reset_trace_state()
-    messages = [{"role": "user", "content": build_task_prompt(issue_text, repo_summary, config)}]
+    messages = [
+        {"role": "user", "content": build_task_prompt(issue_text, repo_summary, config)}
+    ]
     last_read_steps = {}
     last_mutations = {}
     last_reads = {}
@@ -154,7 +153,9 @@ def run_single_agent(issue_text, repo_summary, config):
                     "stop_reason": stop_reason,
                     "final_response": final_text,
                     "acceptance": acceptance,
-                    "diff_summary": get_diff_summary(config.repo_path, config.max_diff_lines),
+                    "diff_summary": get_diff_summary(
+                        config.repo_path, config.max_diff_lines
+                    ),
                     "metrics": build_metrics(config, acceptance, tool_call_total),
                 }
             messages.append({"role": "user", "content": tool_results})
@@ -180,7 +181,9 @@ def run_single_agent(issue_text, repo_summary, config):
                 "stop_reason": stop_reason,
                 "final_response": final_text,
                 "acceptance": acceptance,
-                "diff_summary": get_diff_summary(config.repo_path, config.max_diff_lines),
+                "diff_summary": get_diff_summary(
+                    config.repo_path, config.max_diff_lines
+                ),
                 "metrics": build_metrics(config, acceptance, tool_call_total),
             }
 

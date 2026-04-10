@@ -10,64 +10,29 @@ import re
 from nanoagent import (
     MODEL,
     call_api,
+    extract_text,
     get_trace_state,
     make_studio_tools,
     reset_trace_state,
     run_tool,
 )
 from task_support import (
-    TaskConfig,
     evaluate_acceptance,
+    ensure_str_list,
     get_diff_summary,
     get_modified_files,
     load_task_bundle,
     normalize_task_tool_args,
-    read_text,
+    parse_json_object,
+    truncate_text,
 )
 
 
 READ_ONLY_TOOLS = {"read", "glob", "grep"}
 
 
-def extract_text(content_blocks):
-    return "\n".join(
-        block["text"]
-        for block in content_blocks
-        if isinstance(block, dict) and block.get("type") == "text"
-    ).strip()
-
-
-def parse_json_object(text, fallback):
-    if isinstance(text, dict):
-        return text
-    if not isinstance(text, str):
-        return fallback
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return fallback
-        try:
-            value = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return fallback
-    return value if isinstance(value, dict) else fallback
-
-
 def compact_json(value):
     return json.dumps(value, indent=2, sort_keys=True)
-
-
-def ensure_str_list(value):
-    return [str(item) for item in value] if isinstance(value, list) else []
-
-
-def trim_text(text, limit=1600):
-    if len(text) <= limit:
-        return text
-    return text[: limit - 17] + "\n... (truncated)"
 
 
 def summarize_tool_result(tool_name, args, result):
@@ -75,22 +40,22 @@ def summarize_tool_result(tool_name, args, result):
         return result
     if tool_name == "read":
         path = args.get("path", "")
-        return f"Read {path}\n{trim_text(result, 2200)}"
+        return f"Read {path}\n{truncate_text(result, 2200)}"
     if tool_name == "glob":
         path = args.get("path", ".")
         pat = args.get("pat", "")
-        return f"Glob path={path} pat={pat}\n{trim_text(result, 1400)}"
+        return f"Glob path={path} pat={pat}\n{truncate_text(result, 1400)}"
     if tool_name == "grep":
         path = args.get("path", ".")
         pat = args.get("pat", "")
-        return f"Grep path={path} pat={pat}\n{trim_text(result, 1600)}"
+        return f"Grep path={path} pat={pat}\n{truncate_text(result, 1600)}"
     if tool_name == "bash":
         cmd = args.get("cmd", "")
-        return f"Bash cmd={cmd}\n{trim_text(result, 1800)}"
+        return f"Bash cmd={cmd}\n{truncate_text(result, 1800)}"
     if tool_name in {"write", "edit"}:
         path = args.get("path", "")
-        return f"{tool_name.capitalize()} {path}\n{trim_text(result, 1200)}"
-    return trim_text(result, 1200)
+        return f"{tool_name.capitalize()} {path}\n{truncate_text(result, 1200)}"
+    return truncate_text(result, 1200)
 
 
 def format_observations(observations, limit):
@@ -249,10 +214,10 @@ def run_discovery(issue_text, repo_summary, config):
     summary_lines = [
         "Repository discovery:",
         "Top-level entries:",
-        trim_text(root_listing["raw_result"], 1200),
+        truncate_text(root_listing["raw_result"], 1200),
         "",
         "Python files:",
-        trim_text(python_listing["raw_result"], 1800),
+        truncate_text(python_listing["raw_result"], 1800),
         "",
         "Identifier matches:",
     ]
@@ -439,7 +404,10 @@ def normalize_implementer_decision(decision):
         tool_args = dict(decision.get("args", {}))
         if not tool_name:
             tool_name = str(
-                tool_args.get("tool") or tool_args.get("action") or tool_args.get("name") or ""
+                tool_args.get("tool")
+                or tool_args.get("action")
+                or tool_args.get("name")
+                or ""
             ).strip()
         if isinstance(tool_args.get("args"), dict):
             nested_args = dict(tool_args.get("args", {}))
@@ -467,7 +435,9 @@ def normalize_implementer_decision(decision):
         return {
             **decision,
             "tool": tool_name,
-            "args": decision.get("args") if isinstance(decision.get("args"), dict) else tool_args,
+            "args": decision.get("args")
+            if isinstance(decision.get("args"), dict)
+            else tool_args,
         }
     return decision
 
@@ -567,7 +537,9 @@ def run_implementer_pass(issue_text, repo_summary, plan, critique, config):
             condition=config.condition,
             role="implementer",
         )
-        last_raw = response["assistant_text"] or extract_text(response.get("content", []))
+        last_raw = response["assistant_text"] or extract_text(
+            response.get("content", [])
+        )
         messages.append({"role": "assistant", "content": response["content"]})
 
         if response["tool_calls"]:
@@ -713,7 +685,9 @@ def run_orchestrated(issue_text, repo_summary, config):
         if parsed_plan:
             plan.update(parsed_plan)
             merged_files = list(
-                dict.fromkeys(discovery["discovered_files"] + plan["suspected_relevant_files"])
+                dict.fromkeys(
+                    discovery["discovered_files"] + plan["suspected_relevant_files"]
+                )
             )
             plan["suspected_relevant_files"] = merged_files
             break
@@ -789,7 +763,8 @@ def run_orchestrated(issue_text, repo_summary, config):
             )
             merged_files = list(
                 dict.fromkeys(
-                    plan["suspected_relevant_files"] + follow_up_discovery["discovered_files"]
+                    plan["suspected_relevant_files"]
+                    + follow_up_discovery["discovered_files"]
                 )
             )
             plan["suspected_relevant_files"] = merged_files
