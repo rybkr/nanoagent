@@ -1016,7 +1016,7 @@ def run_repl(model: str | None, budget: int) -> int:
             if user_input == "/c":
                 messages.clear()
                 reset_trace_state()
-                print(f"{GREEN}⏺ Cleared conversation{RESET}")
+                print(f"{GREEN}* Cleared conversation{RESET}")
                 continue
             messages.append({"role": "user", "content": user_input})
             tool_step = 0
@@ -1030,7 +1030,7 @@ def run_repl(model: str | None, budget: int) -> int:
             while True:
                 if get_trace_state()["cumulative_total"] >= budget:
                     print(
-                        f"\n{CYAN}⏺{RESET} Token budget exhausted ({budget} total tokens)."
+                        f"\n{CYAN}*{RESET} Token budget exhausted ({budget} total tokens)."
                     )
                     return 0
                 response = call_api(
@@ -1064,7 +1064,7 @@ def run_repl(model: str | None, budget: int) -> int:
                         if block.get("type") == "text" and isinstance(
                             block.get("text"), str
                         ):
-                            print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
+                            print(f"\n{CYAN}*{RESET} {render_markdown(block['text'])}")
                     break
 
                 print(status_line())
@@ -1074,14 +1074,14 @@ def run_repl(model: str | None, budget: int) -> int:
                 # Check each piece of the response for tool calls
                 for block in response_content:
                     if block["type"] == "text":
-                        print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
+                        print(f"\n{CYAN}*{RESET} {render_markdown(block['text'])}")
                     elif block["type"] == "tool_use":
                         tool_step += 1
                         tool_name = block["name"]
                         tool_args = block["input"]
                         arg_preview = str(next(iter(tool_args.values()), ""))[:50]
                         print(
-                            f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
+                            f"\n{GREEN}* {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
                         )
                         if tool_step > MAX_TOOL_ITERATIONS:
                             result = (
@@ -1148,7 +1148,7 @@ def run_repl(model: str | None, budget: int) -> int:
                         {"role": "user", "content": "\n".join(tool_content_strings)}
                     )
                 elif halt_reason != "":
-                    print(f"\n{CYAN}⏺{RESET} {halt_reason}.")
+                    print(f"\n{CYAN}*{RESET} {halt_reason}.")
                     break
                 else:
                     break
@@ -1157,7 +1157,7 @@ def run_repl(model: str | None, budget: int) -> int:
             break
         except Exception as err:
             traceback.print_exc()
-            print(f"{RED}⏺ Error: {err}{RESET}")
+            print(f"{RED}* Error: {err}{RESET}")
 
     return 0
 
