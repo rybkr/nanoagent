@@ -78,6 +78,7 @@ TRACE_PATH = LOG_DIR / "traces.jsonl"
 RAW_RESPONSE_LOG_PATH = LOG_DIR / "raw_responses.jsonl"
 DEFAULT_TASK_ID = os.environ.get("TASK_ID", "interactive")
 DEFAULT_BUDGET = 50000
+VERSION = "0.2.0"
 TRACE_STATE: dict[str, int] = {
     "cumulative_total": 0,
     "last_input_tokens": 0,
@@ -1277,6 +1278,12 @@ def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for either REPL or packaged-task execution."""
     parser = argparse.ArgumentParser(
         description="Run nanoagent interactively or execute a packaged task workflow."
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
     )
     parser.add_argument("--task", help="Path to the task directory")
     parser.add_argument(
