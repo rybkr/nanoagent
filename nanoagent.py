@@ -46,6 +46,11 @@ type Response = dict[str, object]
 type Usage = dict[str, int]
 type ToolState = dict[str, object]
 
+TOOL_NAME_ALIASES = {
+    "return_to_user": "returnToUser",
+    "returntouser": "returnToUser",
+}
+
 # Constants
 API_URL = os.environ.get("API_URL")
 API_KEY = os.environ.get("API_KEY")
@@ -63,7 +68,7 @@ def resolve_log_path(path_value: str, base_dir: str | Path | None = None) -> Pat
 
 
 LOG_DIR = resolve_log_path(os.environ.get("LOG_DIR", "results"), PROJECT_ROOT)
-TOOL_MODE = os.environ.get("TOOL_MODE", "native").strip().lower()
+TOOL_MODE = os.environ.get("TOOL_MODE", "auto").strip().lower()
 try:
     STUDIO_TIMEOUT_SECONDS = int(os.environ.get("STUDIO_TIMEOUT_SECONDS", "60"))
 except ValueError:
@@ -313,6 +318,7 @@ TOOLS: dict[str, ToolSpec] = {
 
 def run_tool(name: str, args: JSONObject) -> str:
     """Execute a tool"""
+    name = canonicalize_tool_name(name)
     try:
         return TOOLS[name][2](args)
     except KeyError:
@@ -351,8 +357,24 @@ def make_studio_tools() -> list[dict[str, object]]:
     return tools
 
 
+def canonicalize_tool_name(name: str) -> str:
+    """Map common alias spellings onto the declared tool names."""
+    return TOOL_NAME_ALIASES.get(name.strip().lower(), name)
+
+
+def should_use_native_tools(model: str | None) -> bool:
+    """Pick the safer tool-calling mode for the selected model."""
+    if TOOL_MODE == "native":
+        return True
+    if TOOL_MODE == "emulated":
+        return False
+    model_name = (model or "").strip().lower()
+    return "llama" not in model_name
+
+
 def get_tool_path(name: str, args: JSONObject) -> Path | None:
     """Resolve the tool path"""
+    name = canonicalize_tool_name(name)
     if name not in {"read", "write", "edit", "glob", "grep"}:
         return None
     path = args.get("path")
@@ -361,6 +383,7 @@ def get_tool_path(name: str, args: JSONObject) -> Path | None:
 
 def make_tool_signature(name: str, args: JSONObject) -> str:
     """Fill in the arguments for a tool"""
+    name = canonicalize_tool_name(name)
     normalized_args = dict(args)
     path = get_tool_path(name, args)
     if path is not None:
@@ -369,6 +392,90 @@ def make_tool_signature(name: str, args: JSONObject) -> str:
         {"name": name, "arguments": normalized_args},
         sort_keys=True,
     )
+
+
+def _first_non_empty(args: JSONObject, keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def normalize_live_tool_args(tool_name: str, args: JSONObject) -> JSONObject:
+    """Best-effort repair for malformed tool arguments from weaker tool callers."""
+    tool_name = canonicalize_tool_name(tool_name)
+    normalized = dict(args)
+
+    if tool_name in {"read", "write", "edit", "glob", "grep"} and not isinstance(
+        normalized.get("path"), str
+    ):
+        path_value = _first_non_empty(
+            normalized,
+            ("file", "file_path", "filepath", "filename", "target", "target_path"),
+        )
+        if path_value is not None:
+            normalized["path"] = path_value
+
+    if tool_name == "write" and not isinstance(normalized.get("content"), str):
+        content_value = _first_non_empty(
+            normalized,
+            ("contents", "text", "code", "value", "body"),
+        )
+        if content_value is not None:
+            normalized["content"] = content_value
+
+    if tool_name == "edit":
+        if not isinstance(normalized.get("old"), str):
+            old_value = _first_non_empty(
+                normalized,
+                ("old_string", "find", "search", "target_text"),
+            )
+            if old_value is not None:
+                normalized["old"] = old_value
+        if not isinstance(normalized.get("new"), str):
+            new_value = _first_non_empty(
+                normalized,
+                ("new_string", "replace", "replacement", "replacement_text"),
+            )
+            if new_value is not None:
+                normalized["new"] = new_value
+
+    if tool_name in {"glob", "grep"} and not isinstance(normalized.get("pat"), str):
+        pat_value = _first_non_empty(normalized, ("pattern", "glob", "regex", "query"))
+        if pat_value is not None:
+            normalized["pat"] = pat_value
+
+    if tool_name == "glob":
+        path_value = normalized.get("path")
+        if isinstance(path_value, str) and path_value and not isinstance(
+            normalized.get("pat"), str
+        ):
+            wildcard_index = next(
+                (
+                    i
+                    for i, char in enumerate(path_value)
+                    if char in {"*", "?", "["}
+                ),
+                -1,
+            )
+            if wildcard_index != -1:
+                wildcard_path = Path(path_value)
+                normalized["path"] = str(wildcard_path.parent)
+                normalized["pat"] = wildcard_path.name
+
+    if tool_name == "bash" and not isinstance(normalized.get("cmd"), str):
+        cmd_value = _first_non_empty(
+            normalized,
+            ("command", "shell", "shell_command", "script"),
+        )
+        if cmd_value is not None:
+            normalized["cmd"] = cmd_value
+
+    if tool_name in {"read", "glob", "grep"} and "path" not in normalized:
+        normalized["path"] = "."
+
+    return normalized
 
 
 def normalize_read_output(result: str) -> str:
@@ -666,6 +773,7 @@ def extract_tool_calls(raw_calls: object) -> tuple[list[dict[str, object]], list
         name = function.get("name")
         if not isinstance(name, str):
             continue
+        name = canonicalize_tool_name(name)
         arguments, error = parse_tool_arguments(function.get("arguments"))
         if error is not None or arguments is None:
             errors.append(
@@ -673,6 +781,7 @@ def extract_tool_calls(raw_calls: object) -> tuple[list[dict[str, object]], list
                 f"{error or 'invalid arguments'}"
             )
             continue
+        arguments = normalize_live_tool_args(name, arguments)
         calls.append(
             {
                 "id": tool_call.get("id", f"call_{i}"),
@@ -710,6 +819,7 @@ def extract_structured_response(
             arguments = function.get("arguments", {})
         if not isinstance(name, str):
             continue
+        name = canonicalize_tool_name(name)
         parsed_arguments, error = parse_tool_arguments(arguments)
         if error is not None or parsed_arguments is None:
             errors.append(
@@ -717,6 +827,7 @@ def extract_structured_response(
                 f"{error or 'invalid arguments'}"
             )
             continue
+        parsed_arguments = normalize_live_tool_args(name, parsed_arguments)
         tool_calls.append(
             {
                 "id": tool_call.get("id", f"call_{i}"),
@@ -836,14 +947,22 @@ def call_api(
         raise RuntimeError("Missing API_KEY")
     if not API_URL:
         raise RuntimeError("Missing API_URL")
-    use_native_tools = bool(tools) and TOOL_MODE == "native"
+    use_native_tools = bool(tools) and should_use_native_tools(model)
     extra_instruction = ""
     if tools and not use_native_tools:
+        tool_names = ", ".join(
+            tool.get("function", {}).get("name", "")
+            for tool in tools
+            if isinstance(tool, dict)
+        )
         extra_instruction = (
-            "\n\nTool use is being emulated for this request. If you need a tool, respond "
-            "with JSON only in this shape: "
+            "\n\nTool use is being emulated for this request. "
+            f"Available tools: {tool_names}. "
+            "If you need a tool, respond with exactly one JSON object and no markdown, "
+            "no code fences, and no surrounding prose. Use this shape: "
             '{"assistant_text":"","tool_calls":[{"id":"call_1","name":"tool_name",'
-            '"arguments":{"arg":"value"}}]}. If you do not need a tool, respond with '
+            '"arguments":{"arg":"value"}}]}. '
+            "If you are done, call returnToUser. If you do not need a tool, respond with "
             "normal assistant text."
         )
     request = urllib.request.Request(
@@ -954,7 +1073,7 @@ Operate with this protocol:
 3. Prefer the minimum number of tool calls needed to complete the task.
 4. Read before editing existing files unless the user explicitly asked to overwrite them.
 5. Prefer read, glob, and grep over bash whenever they can accomplish the task.
-6. You must call return_to_user if no other tools are needed to fulfill the request.
+6. You must call returnToUser if no other tools are needed to fulfill the request.
 7. Never read a file you just wrote unless specifically asked to.
 
 cwd: {os.getcwd()}
@@ -1138,15 +1257,7 @@ def run_repl(model: str | None, budget: int) -> int:
                 )
 
                 if len(tool_results) > 0 and response["stop_reason"] == "tool_calls":
-                    # Nifty trick to trim down "noise" in the message content
-                    tool_content_strings = []
-                    for tool_string in tool_results:
-                        tool_content_strings.append(
-                            f"A tool call created the following output: {tool_string['content']}"
-                        )
-                    messages.append(
-                        {"role": "user", "content": "\n".join(tool_content_strings)}
-                    )
+                    messages.append({"role": "user", "content": tool_results})
                 elif halt_reason != "":
                     print(f"\n{CYAN}*{RESET} {halt_reason}.")
                     break
